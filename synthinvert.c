@@ -12,7 +12,13 @@
 #include <time.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/sem.h>
+#include <sys/ipc.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
 
 #include <jack/jack.h>
 #include <jack/ringbuffer.h>
@@ -20,7 +26,9 @@
 
 typedef int midi_note_t;  /* 0-127, 21=A0, 60=C4 */
 typedef jack_default_audio_sample_t sample_t;
-
+typedef union {
+  int val; struct semid_ds *buf; unsigned short  *array;
+} semctl_arg_t;
 const char *name = "synthinvert";
 const char *srcport = NULL;
 const char *dbfname = NULL;
@@ -100,11 +108,29 @@ void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
   pthread_mutex_lock (&trace_buf->lock);
   memfile_printf (trace_buf, "%c %s ", trace_level_symb [pri], timestr);
   va_list ap; va_start (ap, fmt);
-  memfile_vprintf (trace_buf, fmt, ap); memfile_printf (trace_buf, " [%s]\n", fn);
+  memfile_vprintf (trace_buf, fmt, ap); memfile_printf (trace_buf, " [%s tid=0x%X]\n", fn, (int) pthread_self ());
   pthread_mutex_unlock (&trace_buf->lock);
   va_end (ap);
 }
-#define TRACE(pri, ...) trace_msg (pri, __func__, __VA_ARGS__)
+#define TRACE( pri, ... ) trace_msg (pri, __func__, __VA_ARGS__)
+#define TRACE_PERROR( pri, called) do {                     \
+    char buf [1000]; strerror_r (errno, buf, sizeof (buf)); \
+    TRACE (pri, "%s: %s", called, buf);                     \
+  } while (0)
+
+#if 0
+#include <execinfo.h>
+void print_backtrace () {
+  void *array[30];
+  size_t size = backtrace (array, 30);
+  char **strings = backtrace_symbols (array, size);
+  
+  TRACE (TRACE_DIAG, "Obtained %zd stack frames", size);
+  for (size_t i = 0; i < size; i++)
+    TRACE (TRACE_DIAG, "%s", strings [i]);  
+  free (strings);
+}
+#endif
 
 sf_count_t my_sf_tell (SNDFILE *sndfile)
 { return sf_seek (sndfile, 0, SEEK_CUR); }
@@ -118,6 +144,7 @@ typedef struct {
 } analyzer_state;
 enum { ANL_EVT_PEAK = 0 };
 
+sigset_t sigmask;
 pthread_t poll_thread_tid = 0;
 jack_nframes_t initial_silence_frames = 0, wavebrk_silence_frames = 0;
 long srate = 0;
@@ -127,9 +154,9 @@ jack_nframes_t jmaxbufsz = 0;
 jack_port_t *jport = NULL;
 jack_ringbuffer_t *jbuf = NULL;
 sample_t *jdataptr = NULL, *jdataend = NULL;
-jack_nframes_t jbufavail = 0, jdatalen = 0;
-pthread_mutex_t jbufavail_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t jbufavail_cond = PTHREAD_COND_INITIALIZER;
+jack_nframes_t jdatalen = 0;
+int jbufavail_semid; int jbufavail_valid = 0;
+sem_t jcon_sem;
 sample_t norm_noise_peak = 0;
 analyzer_state stdmidi_anls;
 double jnorm_factor = 0.0;
@@ -139,7 +166,7 @@ void analyzer_state_init (analyzer_state *s) {
   s->voiced_ago = 15 * srate;
 }
 
-void shutdown (int failure);
+static void myshutdown (int failure);
 
 void process_sample (sample_t x, analyzer_state * const s) {
   s->event = 0;
@@ -167,18 +194,18 @@ void process_sample (sample_t x, analyzer_state * const s) {
   ++s->count;
 }
 
-int process_waveform_db () {
+static void process_waveform_db () {
   SF_INFO sf_info;
   memset (&sf_info, sizeof (sf_info), 0);
   SNDFILE *dbf = sf_open (dbfname, SFM_READ, &sf_info);
   if (NULL == dbf) {
     TRACE (TRACE_FATAL, "Could not open file %s", dbfname);
-    return 0;
+    myshutdown (1);
   }
   if (1 != sf_info.channels) {
     TRACE (TRACE_FATAL, "File %s has %d channels, expecting exactly 1",
                dbfname, (int) sf_info.channels);
-    return 0;
+    myshutdown (1);
   }
   srate = sf_info.samplerate;
   initial_silence_frames = srate / 100 * initial_silence_ms / 10;
@@ -198,14 +225,14 @@ int process_waveform_db () {
              (float) norm_noise_peak);
 
   for (midi_note_t n = lomidi; n <= himidi; n++) {
-    TRACE (TRACE_INT, "Reading MIDI %d waveform, frame=%ld",
+    TRACE (TRACE_INT + 1, "Reading MIDI %d waveform, frame=%ld",
                (int) n, (long) my_sf_tell (dbf));
     // skip silence
     while (anls.voiced_ago > 1) {
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
       process_sample (x, &anls);
     }
-    TRACE (TRACE_INT, "Found note at frame=%ld",
+    TRACE (TRACE_INT + 1, "Found note at frame=%ld",
                (long) my_sf_tell (dbf));
 
     sf_count_t note_pos = my_sf_tell (dbf);
@@ -215,13 +242,13 @@ int process_waveform_db () {
       process_sample (x, &anls);
       // TODO: analyze waveform
     }
-    TRACE (TRACE_INT, "MIDI %d Waveform ends at frame=%ld",
+    TRACE (TRACE_INT + 1, "MIDI %d Waveform ends at frame=%ld",
                (int) n, (long) my_sf_tell (dbf));
     if (n == stdmidi) {
       sf_count_t saved_pos = my_sf_tell (dbf);
       sf_seek (dbf, note_pos, SEEK_SET);
       stdanls.npeaks = 0; stdanls.max_peak = 0; stdanls.max_peak_idx = 0;
-      TRACE (TRACE_INT, "Back to frame=%ld for stdmidi",
+      TRACE (TRACE_INT + 1, "Back to frame=%ld for stdmidi",
                  (long) my_sf_tell (dbf));
       // gather calibration info
       while (stdanls.voiced_ago < wavebrk_silence_frames &&
@@ -230,44 +257,47 @@ int process_waveform_db () {
         if (sf_read_double (dbf, &x, 1) < 1) goto premature;
         process_sample (x, &stdanls);
         if ((stdanls.event & (1 << ANL_EVT_PEAK)) != 0)
-          TRACE (TRACE_INT, "Peak at frame %ld %f",
+          TRACE (TRACE_INT + 2, "Peak at frame %ld %f",
                  (long) my_sf_tell (dbf), (float) stdanls.old_peak);
       }
       stdmidi_anls = stdanls;
       sf_seek (dbf, saved_pos, SEEK_SET);
-      TRACE (TRACE_INT, "Returned to frame=%ld",
+      TRACE (TRACE_INT + 1, "Returned to frame=%ld",
                  (long) my_sf_tell (dbf));
     }
   }
 
-  return 1;
+  return;
 
 premature:
   TRACE (TRACE_FATAL, "Premature end of waveform db file, frame=%ld",
              (long) my_sf_tell (dbf));
-  return 0;
+  myshutdown (1);
 }
 
 sample_t get_jsample () {
-  if (zombified) {
-    TRACE (TRACE_FATAL, "Jack shut us down");
-    shutdown (1);
-  }
+  int rc;
+
   if (jdataptr == jdataend) {
     jack_ringbuffer_read_advance (jbuf, jdatalen * sizeof (sample_t));
     jdataptr = jdataend = NULL;
-    for (pthread_mutex_lock (&jbufavail_lock);
-         jbufavail <= 0;
-         pthread_cond_wait (&jbufavail_cond, &jbufavail_lock));
+    struct sembuf sops1 = { .sem_num = 0, .sem_op = -1, .sem_flg = 0 };
+    while ((rc = semop (jbufavail_semid, &sops1, 1)) == -1)
+      if (rc == -1 && errno != EINTR) {
+        TRACE_PERROR (TRACE_FATAL, "semop");
+        myshutdown (1);
+      }
+    if (zombified) {
+      myshutdown (1);
+    }
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
     jdatalen = jdatainfo [0].len / sizeof (sample_t);
-    if (jdatalen > jbufavail) jdatalen = jbufavail;
-    jbufavail -= jdatalen;
-    pthread_mutex_unlock (&jbufavail_lock);
+    struct sembuf sops2 = { .sem_num = 0, .sem_op = -(jdatalen - 1), .sem_flg = 0 };
+    semop (jbufavail_semid, &sops2, 1);
     if (jdatalen == 0) {
-      TRACE (TRACE_FATAL, "jdatalen=0, jbufavail=%d, jdatainfo=%d", (int) jbufavail, (int) jdatainfo [0].len);
-      shutdown (1);
+      TRACE (TRACE_FATAL, "jdatalen=0, jdatainfo=%d", (int) jdatainfo [0].len);
+      myshutdown (1);
     }
     jdataptr = (sample_t *) jdatainfo [0].buf;
     jdataend = jdataptr + jdatalen;
@@ -275,33 +305,39 @@ sample_t get_jsample () {
   return *jdataptr++;
 }
 
-void *process_thread (void *arg) {
+static void *process_thread (void *arg) {
   (void) arg;
 
+  int connected = 0;
+
   for (;;) {
+
+    if (! connected && sem_trywait (&jcon_sem))
+      connected = 1;
+
     jack_nframes_t nframes_orig = jack_cycle_wait (jclient),
       nframes = nframes_orig;
-    if (nframes <= 0 || zombified) break;
+    if (zombified) break;
     sample_t *in = jack_port_get_buffer (jport, nframes);
     size_t avail = jack_ringbuffer_write_space (jbuf) / sizeof (sample_t);
     if (avail < nframes) nframes = avail;
-    jack_nframes_t saved_bytes = 
+    if (connected)
       jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
     jack_cycle_signal (jclient, 0);
 
-    assert (saved_bytes == nframes * sizeof (sample_t));
-    pthread_mutex_lock (&jbufavail_lock);
-    jbufavail += nframes;
-    pthread_cond_signal (&jbufavail_cond);
-    pthread_mutex_unlock (&jbufavail_lock);
+    if (connected && nframes > 0) {
+      struct sembuf sops1 = { .sem_num = 0, .sem_op = nframes, .sem_flg = 0 };
+      semop (jbufavail_semid, &sops1, 1);
+    }
     if (nframes != nframes_orig)
       TRACE (TRACE_WARN, "Lost frames %d", (int) (nframes_orig - nframes));
+    
   }
 
   return NULL;
 }
 
-void calibrate () {
+static void calibrate () {
   sample_t noise_peak;
   analyzer_state anls;
   analyzer_state_init (&anls);
@@ -322,34 +358,45 @@ void calibrate () {
   while (process_sample (get_jsample (), &anls),
          (anls.voiced_ago < wavebrk_silence_frames && anls.npeaks < stdmidi_npeaks)) {
     if ((anls.event & (1 << ANL_EVT_PEAK)) != 0)
-      TRACE (TRACE_INT, "Peak at frame %d %f", (int) anls.count, (float) anls.old_peak);
+      TRACE (TRACE_INT + 1, "Peak at frame %d %f", (int) anls.count, (float) anls.old_peak);
   }
   if (anls.max_peak_idx != stdmidi_anls.max_peak_idx) {
     TRACE (TRACE_FATAL, "calibration mismatch npeaks=%d %d %d %f %f",
                anls.npeaks,
                anls.max_peak_idx, stdmidi_anls.max_peak_idx,
                anls.max_peak, stdmidi_anls.max_peak);
-    shutdown (1);
+    myshutdown (1);
   }
   jnorm_factor = anls.max_peak / stdmidi_anls.max_peak;
   TRACE (TRACE_INFO, "Scaling factor against waveform db: %f", (float) jnorm_factor);
 }
 
-void midi_server () {
+static void midi_server () {
 }
 
-void on_jack_shutdown (void *arg) {
+static void on_jack_shutdown (void *arg) {
   (void) arg;
 
   zombified = 1;
   TRACE (TRACE_FATAL, "Jack shut us down");
-  shutdown (1);
+  myshutdown (1);
 }
 
-int setup_audio () {
+static void setup_audio () {
   TRACE (TRACE_INT, "jack setup");
   fflush(stdout); fflush (stderr);
 
+  if (-1 == (jbufavail_semid = semget (IPC_PRIVATE, 1, IPC_CREAT | S_IRUSR | S_IWUSR))) {
+    TRACE_PERROR (TRACE_FATAL, "semget");
+    myshutdown (1);
+  }
+  jbufavail_valid = 1;
+  semctl_arg_t semarg = { .val = 0 };
+  if (-1 == semctl (jbufavail_semid, 0, SETVAL, semarg)) {
+    TRACE_PERROR (TRACE_FATAL, "semctl");
+    myshutdown (1);
+  }
+  sem_init (&jcon_sem, 0, 0);
   jack_options_t jopt = 0;  // JackNoStartServer;
   jack_status_t jstat;
   if (NULL == (jclient = jack_client_open (name, jopt, &jstat)))
@@ -365,28 +412,27 @@ int setup_audio () {
   jmaxbufsz = jack_get_buffer_size (jclient);
   TRACE (TRACE_INFO, "Connected client, bufsize=%d, srate=%d",
              (int) jmaxbufsz, (int) srate);
-  jbuf = jack_ringbuffer_create (64 * jmaxbufsz * sizeof (sample_t));
+  jbuf = jack_ringbuffer_create (16384);
 
   if (0 != jack_set_process_thread (jclient, process_thread, NULL))
     goto jack_setup_fail;
 
+  if (NULL == (jport = jack_port_register (jclient, "in", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0)))
+    goto jack_setup_fail;
+  
   if (0 != jack_activate (jclient))
     goto jack_setup_fail;
 
-  if (NULL == (jport = jack_port_register (jclient, "in", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0)))
-    goto jack_setup_fail;
-  TRACE (TRACE_INT, "jport=%p", jport);
-  
   if (0 != jack_connect (jclient, srcport, jack_port_name (jport)))
     goto jack_setup_fail;
+  sem_post (&jcon_sem);
+  TRACE (TRACE_DIAG, "Activated");
 
-  return 1;
+  return;
 
 jack_setup_fail:
   TRACE (TRACE_FATAL, "Jack setup failed");
-  if (jclient != NULL)
-    jack_client_close (jclient);
-  return 0; 
+  myshutdown (1);
 }
 
 midi_note_t scinote2midi (char *scinote) {
@@ -398,7 +444,7 @@ midi_note_t scinote2midi (char *scinote) {
   return 21 + 12 * o + semitones [l];
 }
 
-void parse_args (char **argv) {
+static void parse_args (char **argv) {
   for (++argv; *argv != NULL; ++argv) {
     if (*argv [0] == '-') {
       if (0 == strcmp (*argv, "--db")) {
@@ -416,19 +462,19 @@ void parse_args (char **argv) {
 
   if (NULL == dbfname) {
     TRACE (TRACE_FATAL, "waveform database file (--db) not specified");
-    shutdown (1);
+    myshutdown (1);
   }
   if (0 == himidi) {
     TRACE (TRACE_FATAL, "note range (e.g. --range G2C5) not specified");
-    shutdown (1);
+    myshutdown (1);
   }
   if (lomidi > stdmidi || stdmidi > himidi) {
     TRACE (TRACE_FATAL, "calibration note out of range");
-    shutdown (1);
+    myshutdown (1);
   }
   if (NULL == srcport) {
     TRACE (TRACE_FATAL, "no source port (--port) specified");
-    shutdown (1);
+    myshutdown (1);
   }
 }
 
@@ -440,7 +486,7 @@ void trace_flush () {
   fflush (stdtrace);
 }
 
-void *poll_thread (void *arg) {
+static void *poll_thread (void *arg) {
   (void) arg;
 
   for (;;) {
@@ -448,9 +494,11 @@ void *poll_thread (void *arg) {
     nanosleep (&sleepreq, NULL);
     trace_flush ();
   }
+
+  return NULL;
 }
 
-void init_trace () {
+static void init_trace () {
   trace_buf = memfile_alloc (1 << 20);
   stdtrace = fdopen (dup (fileno (stdout)), "w");
   setvbuf (stdtrace, malloc (1 << 16), _IOFBF, 1 << 16);
@@ -458,14 +506,50 @@ void init_trace () {
   TRACE (TRACE_INFO, "Starting");
 }
 
-void shutdown (int failure) {
+static void cleanup () {
   pthread_cancel (poll_thread_tid);
   pthread_join (poll_thread_tid, NULL);
-  if (jclient != NULL && ! zombified)
+  if (jclient != NULL) {
+    jack_on_shutdown (jclient, NULL, NULL);
     jack_client_close (jclient);
-  TRACE (TRACE_INFO, "Exiting");
+    jclient = NULL;
+  }
+  if (jbufavail_valid) {
+    jbufavail_valid = 0;
+    semctl (jbufavail_semid, 0, IPC_RMID);
+  }
+  TRACE (TRACE_INFO, "Cleanup finished");
   trace_flush ();
+}
+
+static void myshutdown (int failure) {
+  TRACE (TRACE_INFO, "shutdown requested");
+  // print_backtrace ();
+  cleanup ();
   exit (failure ? EXIT_FAILURE : EXIT_SUCCESS);
+}
+
+static void sig_handler (int sig) {
+  TRACE (TRACE_INFO, "Caught signal %d", sig);
+  cleanup ();
+  struct sigaction act =
+    { .sa_mask = sigmask, .sa_flags = 0, .sa_handler = SIG_DFL };
+  sigaction (sig, &act, NULL);
+  pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
+  pthread_kill (pthread_self (), sig);
+}
+
+void setup_sigs () {
+  int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGINT };
+  sigemptyset (&sigmask);
+  for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); i++)
+    sigaddset (&sigmask, sigarr [i]);
+  pthread_sigmask (SIG_BLOCK, &sigmask, NULL);
+  struct sigaction act =
+    { .sa_mask = sigmask, .sa_flags = 0, .sa_handler = sig_handler };
+  for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); i++)
+    sigaction (sigarr [i], &act, NULL);
+
 }
 
 int main (int argc, char **argv) {
@@ -473,17 +557,21 @@ int main (int argc, char **argv) {
 
   init_trace ();
 
+  setup_sigs ();
+
   parse_args (argv);
 
-  if (! process_waveform_db ())
-    shutdown (1);
+  process_waveform_db ();
 
-  if (! setup_audio ())
-    shutdown (1);
+  setup_audio ();
+
+  pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
+
   calibrate ();
+
   midi_server ();
 
-  shutdown (0); return EXIT_SUCCESS;
+  myshutdown (0); return EXIT_SUCCESS;
 }
 
 /*
