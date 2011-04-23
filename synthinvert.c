@@ -149,6 +149,11 @@ typedef struct {
 } analyzer_state;
 enum { ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL };
 
+typedef struct {
+  sample_t level;
+  jack_nframes_t length;
+} gridpt;
+
 static const midi_note_t note_semitones [] = { 0, 2, 3, 5, 7, 8, 10, 12 };
 double note_midi2freq (midi_note_t midi) {
   return 27.5 * exp (.05776226504666210911 * (midi - 21));  // A0 = 27.5
@@ -156,7 +161,6 @@ double note_midi2freq (midi_note_t midi) {
 void note_midi2sci (midi_note_t midi, char *sci) {
   midi_note_t o = (midi - 21) / 12,
     s = midi - 21 - 12 * o;
-  TRACE (TRACE_INFO, "s=%d", s);
   int sharp = 0;
   char l;
   for (l = 'A'; l <= 'G' && note_semitones [l - 'A'] < s; l++);
@@ -190,6 +194,8 @@ sem_t jcon_sem;
 sample_t norm_noise_peak = 0;
 analyzer_state stdmidi_anls;
 double jnorm_factor = 0.0;
+gridpt *gridpt_buf = NULL;
+size_t gridpt_buf_max = 0, gridpt_buf_cnt = 0;
 
 void analyzer_state_init (analyzer_state *s) {
   memset (s, 0, sizeof (*s));
@@ -204,6 +210,8 @@ void analyze_sample (sample_t x, analyzer_state * const s) {
   if (absx > s->max_x)
     s->max_x = absx;
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
+    if (s->voiced_ago >= wavebrk_sil_frames)
+      s->evt |= (1 << ANL_EVT_ZERO);
     s->voiced_ago = 0;
     if (absx > 5 * s->noise_peak && s->peak * (s->peak - x) <= 0) {
       s->peak = x;
@@ -229,8 +237,7 @@ void analyze_sample (sample_t x, analyzer_state * const s) {
 }
 
 static void process_waveform_db () {
-  SF_INFO sf_info;
-  memset (&sf_info, sizeof (sf_info), 0);
+  SF_INFO sf_info; memset (&sf_info, sizeof (sf_info), 0);
   SNDFILE *dbf = sf_open (dbfname, SFM_READ, &sf_info);
   if (NULL == dbf) {
     TRACE (TRACE_FATAL, "Could not open file %s", dbfname);
@@ -245,10 +252,11 @@ static void process_waveform_db () {
   initial_sil_frames = srate / 100 * initial_sil_ms / 10;
   wavebrk_sil_frames = srate / 100 * wavebrk_sil_ms / 10;
   note_recog_frames = srate / 100 * note_recog_ms / 10;
+  gridpt_buf_max = srate / note_midi2freq (himidi) * 4;
+  gridpt_buf = calloc (sizeof (gridpt), gridpt_buf_max);
 
   double x;
-  analyzer_state anls;
-  analyzer_state_init (&anls);
+  analyzer_state anls; analyzer_state_init (&anls);
 
   // find noise level in waveform db
   for (sf_count_t i = 0; i < initial_sil_frames; i++) {
@@ -272,10 +280,10 @@ static void process_waveform_db () {
 
     sf_count_t note_pos = my_sf_tell (dbf);
     analyzer_state stdanls = anls;
-    while ((anls.evt & ANL_EVT_SIL) == 0) {
+    gridpt_buf_cnt = 0;
+    while ((anls.evt & (1 << ANL_EVT_SIL)) == 0) {
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
       analyze_sample (x, &anls);
-      // TODO: analyze waveform
     }
     TRACE (TRACE_INT + 1, "MIDI note %d Waveform ends at frame=%ld",
                (int) n, (long) my_sf_tell (dbf));
@@ -286,7 +294,7 @@ static void process_waveform_db () {
       TRACE (TRACE_INT + 1, "Back to frame=%ld for stdmidi",
                  (long) my_sf_tell (dbf));
       // gather calibration info
-      while ((stdanls.evt & ANL_EVT_SIL) == 0 &&
+      while ((stdanls.evt & (1 << ANL_EVT_SIL)) == 0 &&
              stdanls.npeaks < stdmidi_npeaks)
       {
         if (sf_read_double (dbf, &x, 1) < 1) goto premature;
@@ -392,7 +400,7 @@ static void calibrate () {
   TRACE (TRACE_INT, "Found note");
   assert (anls.npeaks == 0);
   while (analyze_sample (get_jsample (), &anls),
-         ((anls.evt & ANL_EVT_SIL) == 0 && anls.npeaks < stdmidi_npeaks))
+         ((anls.evt & (1 << ANL_EVT_SIL)) == 0 && anls.npeaks < stdmidi_npeaks))
   {
     if ((anls.evt & (1 << ANL_EVT_PEAK)) != 0)
       TRACE (TRACE_INT + 1, "Peak at frame %d %f", (int) anls.count, (float) anls.old_peak);
