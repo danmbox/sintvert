@@ -36,8 +36,9 @@ midi_note_t lomidi = 0, himidi = 0;  /* range of our synth */
 midi_note_t stdmidi = 60;  /* note to calibrate against */
 int stdmidi_npeaks = 50;  /* # of peaks to read for calibration */
 int velo0 = 100;
-int initial_silence_ms = 450;
-int wavebrk_silence_ms = 2;
+int initial_sil_ms = 450;
+double wavebrk_sil_ms = 1.5;
+double note_recog_ms = 10;
 
 typedef struct {
   char *buf1, *buf2, *ptr, *end, *other;
@@ -87,6 +88,7 @@ typedef enum {
 } trace_pri_t;
 const char *trace_level_symb = "FEW!ID          ";
 trace_pri_t trace_level = TRACE_INT;
+int trace_print_tid = 0, trace_print_fn = 0;
 memfile *trace_buf = NULL;
 FILE *stdtrace = NULL;
 void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
@@ -108,7 +110,11 @@ void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
   pthread_mutex_lock (&trace_buf->lock);
   memfile_printf (trace_buf, "%c %s ", trace_level_symb [pri], timestr);
   va_list ap; va_start (ap, fmt);
-  memfile_vprintf (trace_buf, fmt, ap); memfile_printf (trace_buf, " [%s tid=0x%X]\n", fn, (int) pthread_self ());
+  memfile_vprintf (trace_buf, fmt, ap);
+  if (trace_print_fn) memfile_printf (trace_buf, " [%s]", fn);
+  if (trace_print_tid)
+    memfile_printf (trace_buf, " [tid=0x%X]", (unsigned) pthread_self ());
+  memfile_printf (trace_buf, "\n");
   pthread_mutex_unlock (&trace_buf->lock);
   va_end (ap);
 }
@@ -136,17 +142,18 @@ sf_count_t my_sf_tell (SNDFILE *sndfile)
 { return sf_seek (sndfile, 0, SEEK_CUR); }
 
 typedef struct {
-  int npeaks;
-  sample_t peak, old_peak;
-  sample_t max_x, max_peak, noise_peak;
-  jack_nframes_t count, max_peak_idx, voiced_ago;
-  int event;
+  int npeaks, max_peak_idx;
+  sample_t x, peak, old_peak, max_x, max_peak, noise_peak;
+  jack_nframes_t count, voiced_ago, peak_at;
+  int evt;
 } analyzer_state;
-enum { ANL_EVT_PEAK = 0 };
+enum { ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL };
 
 sigset_t sigmask;
 pthread_t poll_thread_tid = 0;
-jack_nframes_t initial_silence_frames = 0, wavebrk_silence_frames = 0;
+jack_nframes_t initial_sil_frames = 0,
+  wavebrk_sil_frames = 0,
+  note_recog_frames = 0;
 long srate = 0;
 jack_client_t *jclient = NULL;
 volatile int zombified = 0;
@@ -168,19 +175,21 @@ void analyzer_state_init (analyzer_state *s) {
 
 static void myshutdown (int failure);
 
-void process_sample (sample_t x, analyzer_state * const s) {
-  s->event = 0;
+void analyze_sample (sample_t x, analyzer_state * const s) {
+  s->evt = 0;
   sample_t absx = x > 0 ? x : -x;
   if (absx > s->max_x)
     s->max_x = absx;
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
     s->voiced_ago = 0;
-    if (absx > 5 * s->noise_peak && s->peak * (s->peak - x) <= 0)
+    if (absx > 5 * s->noise_peak && s->peak * (s->peak - x) <= 0) {
       s->peak = x;
+      s->peak_at = s->count;
+    }
   }
   sample_t border = (sample_t) copysign (s->noise_peak, s->peak);
   if (s->peak != 0.0 && (border - x) * (border - s->peak) <= 0) {
-    s->event |= (1 << ANL_EVT_PEAK);
+    s->evt |= (1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO);
     s->npeaks++;
     sample_t abs_peak = s->peak > 0 ? s->peak : -s->peak;
     if (s->peak > s->max_peak) {
@@ -191,7 +200,9 @@ void process_sample (sample_t x, analyzer_state * const s) {
     s->peak = 0.0;
   }
   ++s->voiced_ago;
+  if (s->voiced_ago >= wavebrk_sil_frames) s->evt |= (1 << ANL_EVT_SIL);
   ++s->count;
+  s->x = x;
 }
 
 static void process_waveform_db () {
@@ -208,41 +219,42 @@ static void process_waveform_db () {
     myshutdown (1);
   }
   srate = sf_info.samplerate;
-  initial_silence_frames = srate / 100 * initial_silence_ms / 10;
-  wavebrk_silence_frames = srate / 100 * wavebrk_silence_ms / 10;
+  initial_sil_frames = srate / 100 * initial_sil_ms / 10;
+  wavebrk_sil_frames = srate / 100 * wavebrk_sil_ms / 10;
+  note_recog_frames = srate / 100 * note_recog_ms / 10;
 
   double x;
   analyzer_state anls;
   analyzer_state_init (&anls);
 
   // find noise level in waveform db
-  for (sf_count_t i = 0; i < initial_silence_frames; i++) {
+  for (sf_count_t i = 0; i < initial_sil_frames; i++) {
     if (sf_read_double (dbf, &x, 1) < 1) goto premature;
-    process_sample (x, &anls);
+    analyze_sample (x, &anls);
   }
   norm_noise_peak = anls.noise_peak = 4 * anls.max_x;
   TRACE (TRACE_DIAG, "Noise peak in db file: %.5f",
              (float) norm_noise_peak);
 
   for (midi_note_t n = lomidi; n <= himidi; n++) {
-    TRACE (TRACE_INT + 1, "Reading MIDI %d waveform, frame=%ld",
+    TRACE (TRACE_INT + 1, "Reading MIDI note %d waveform, frame=%ld",
                (int) n, (long) my_sf_tell (dbf));
     // skip silence
     while (anls.voiced_ago > 1) {
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
-      process_sample (x, &anls);
+      analyze_sample (x, &anls);
     }
     TRACE (TRACE_INT + 1, "Found note at frame=%ld",
                (long) my_sf_tell (dbf));
 
     sf_count_t note_pos = my_sf_tell (dbf);
     analyzer_state stdanls = anls;
-    while (anls.voiced_ago < wavebrk_silence_frames) {
+    while ((anls.evt & ANL_EVT_SIL) == 0) {
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
-      process_sample (x, &anls);
+      analyze_sample (x, &anls);
       // TODO: analyze waveform
     }
-    TRACE (TRACE_INT + 1, "MIDI %d Waveform ends at frame=%ld",
+    TRACE (TRACE_INT + 1, "MIDI note %d Waveform ends at frame=%ld",
                (int) n, (long) my_sf_tell (dbf));
     if (n == stdmidi) {
       sf_count_t saved_pos = my_sf_tell (dbf);
@@ -251,12 +263,12 @@ static void process_waveform_db () {
       TRACE (TRACE_INT + 1, "Back to frame=%ld for stdmidi",
                  (long) my_sf_tell (dbf));
       // gather calibration info
-      while (stdanls.voiced_ago < wavebrk_silence_frames &&
+      while ((stdanls.evt & ANL_EVT_SIL) == 0 &&
              stdanls.npeaks < stdmidi_npeaks)
       {
         if (sf_read_double (dbf, &x, 1) < 1) goto premature;
-        process_sample (x, &stdanls);
-        if ((stdanls.event & (1 << ANL_EVT_PEAK)) != 0)
+        analyze_sample (x, &stdanls);
+        if ((stdanls.evt & (1 << ANL_EVT_PEAK)) != 0)
           TRACE (TRACE_INT + 2, "Peak at frame %ld %f",
                  (long) my_sf_tell (dbf), (float) stdanls.old_peak);
       }
@@ -344,20 +356,21 @@ static void calibrate () {
 
   // find noise level
   TRACE (TRACE_DIAG, "Analysing noise...");
-  for (jack_nframes_t i = 0; i < initial_silence_frames; i++)
-    process_sample (get_jsample (), &anls);
+  for (jack_nframes_t i = 0; i < initial_sil_frames; i++)
+    analyze_sample (get_jsample (), &anls);
   noise_peak = anls.noise_peak = 4 * anls.max_x;
   TRACE (TRACE_DIAG, "Noise peak in input: %.5f", (float) noise_peak);
 
   // skip silence
-  TRACE (TRACE_DIAG, "Calibrating against MIDI %d waveform", (int) stdmidi);
-  while (process_sample (get_jsample (), &anls), anls.voiced_ago > 1);
+  TRACE (TRACE_IMPT, "Calibrating against MIDI note %d waveform: press note now", (int) stdmidi);
+  while (analyze_sample (get_jsample (), &anls), anls.voiced_ago > 1);
 
   TRACE (TRACE_INT, "Found note");
   assert (anls.npeaks == 0);
-  while (process_sample (get_jsample (), &anls),
-         (anls.voiced_ago < wavebrk_silence_frames && anls.npeaks < stdmidi_npeaks)) {
-    if ((anls.event & (1 << ANL_EVT_PEAK)) != 0)
+  while (analyze_sample (get_jsample (), &anls),
+         ((anls.evt & ANL_EVT_SIL) == 0 && anls.npeaks < stdmidi_npeaks))
+  {
+    if ((anls.evt & (1 << ANL_EVT_PEAK)) != 0)
       TRACE (TRACE_INT + 1, "Peak at frame %d %f", (int) anls.count, (float) anls.old_peak);
   }
   if (anls.max_peak_idx != stdmidi_anls.max_peak_idx) {
@@ -410,7 +423,7 @@ static void setup_audio () {
   }
 
   jmaxbufsz = jack_get_buffer_size (jclient);
-  TRACE (TRACE_INFO, "Connected client, bufsize=%d, srate=%d",
+  TRACE (TRACE_INFO, "Connected to jack, bufsize=%d, srate=%d",
              (int) jmaxbufsz, (int) srate);
   jbuf = jack_ringbuffer_create (16384);
 
@@ -453,8 +466,16 @@ static void parse_args (char **argv) {
         lomidi = scinote2midi (argv [1]);
         himidi = scinote2midi (argv [1] + 2);
         ++argv;
-      } else if (0 == strcmp (*argv, "--port")) {
+      } else if (0 == strcmp (*argv, "-p") || 0 == strcmp (*argv, "--port")) {
         srcport = *++argv;
+      } else if (0 == strcmp (*argv, "--log-level")) {
+        int l; sscanf (*++argv, "%d", &l);
+        TRACE (TRACE_IMPT, "Log level %d", l);
+        trace_level = l;
+      } else if (0 == strcmp (*argv, "--log-tid")) {
+        trace_print_tid = 1;
+      } else if (0 == strcmp (*argv, "--log-fun")) {
+        trace_print_fn = 1;
       }
     }
     else break;
@@ -499,11 +520,11 @@ static void *poll_thread (void *arg) {
 }
 
 static void init_trace () {
-  trace_buf = memfile_alloc (1 << 20);
+  trace_buf = memfile_alloc (1 << 18);
   stdtrace = fdopen (dup (fileno (stdout)), "w");
-  setvbuf (stdtrace, malloc (1 << 16), _IOFBF, 1 << 16);
+  setvbuf (stdtrace, NULL, _IONBF, 0);
   pthread_create (&poll_thread_tid, NULL, poll_thread, NULL);
-  TRACE (TRACE_INFO, "Starting");
+  TRACE (TRACE_INFO, "Logging enabled, level=%d", (int) trace_level);
 }
 
 static void cleanup () {
