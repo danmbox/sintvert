@@ -149,6 +149,29 @@ typedef struct {
 } analyzer_state;
 enum { ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL };
 
+static const midi_note_t note_semitones [] = { 0, 2, 3, 5, 7, 8, 10, 12 };
+double note_midi2freq (midi_note_t midi) {
+  return 27.5 * exp (.05776226504666210911 * (midi - 21));  // A0 = 27.5
+}
+void note_midi2sci (midi_note_t midi, char *sci) {
+  midi_note_t o = (midi - 21) / 12,
+    s = midi - 21 - 12 * o;
+  TRACE (TRACE_INFO, "s=%d", s);
+  int sharp = 0;
+  char l;
+  for (l = 'A'; l <= 'G' && note_semitones [l - 'A'] < s; l++);
+  if (note_semitones [l - 'A'] > s) { sharp = 1; l--; }
+  if (l >= 'C') o++;
+  sprintf (sci, "%c%d%s", l, o, sharp ? "#" : "");
+}
+midi_note_t note_sci2midi (const char *scinote) {
+  char lc = toupper (scinote [0]);
+  
+  midi_note_t l =  lc - 'A',
+    o = scinote [1] - '0' - (lc < 'C' ? 0 : 1);
+  return 21 + 12 * o + note_semitones [l];
+}
+
 sigset_t sigmask;
 pthread_t poll_thread_tid = 0;
 jack_nframes_t initial_sil_frames = 0,
@@ -362,7 +385,8 @@ static void calibrate () {
   TRACE (TRACE_DIAG, "Noise peak in input: %.5f", (float) noise_peak);
 
   // skip silence
-  TRACE (TRACE_IMPT, "Calibrating against MIDI note %d waveform: press note now", (int) stdmidi);
+  char stdscinote [4]; note_midi2sci (stdmidi, stdscinote);
+  TRACE (TRACE_IMPT, "Calibrating against note %s waveform: press note now", stdscinote);
   while (analyze_sample (get_jsample (), &anls), anls.voiced_ago > 1);
 
   TRACE (TRACE_INT, "Found note");
@@ -448,23 +472,14 @@ jack_setup_fail:
   myshutdown (1);
 }
 
-midi_note_t scinote2midi (char *scinote) {
-  static const int semitones [] = { 0, 2, 3, 5, 7, 8, 10, 12 };
-  char lc = toupper (scinote [0]);
-  
-  midi_note_t l =  lc - 'A',
-    o = scinote [1] - '0' - (lc < 'C' ? 0 : 1);
-  return 21 + 12 * o + semitones [l];
-}
-
 static void parse_args (char **argv) {
   for (++argv; *argv != NULL; ++argv) {
     if (*argv [0] == '-') {
       if (0 == strcmp (*argv, "--db")) {
         dbfname = *++argv;
       } else if (0 == strcmp (*argv, "--range")) {
-        lomidi = scinote2midi (argv [1]);
-        himidi = scinote2midi (argv [1] + 2);
+        lomidi = note_sci2midi (argv [1]);
+        himidi = note_sci2midi (argv [1] + 2);
         ++argv;
       } else if (0 == strcmp (*argv, "-p") || 0 == strcmp (*argv, "--port")) {
         srcport = *++argv;
@@ -512,8 +527,8 @@ static void *poll_thread (void *arg) {
 
   for (;;) {
     struct timespec sleepreq = { tv_sec: 0, tv_nsec: 200000000L };
-    nanosleep (&sleepreq, NULL);
     trace_flush ();
+    nanosleep (&sleepreq, NULL);
   }
 
   return NULL;
