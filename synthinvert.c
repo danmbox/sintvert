@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
 #include <math.h>
@@ -39,6 +40,7 @@ int velo0 = 100;
 int initial_sil_ms = 450;
 double wavebrk_sil_ms = 1.5;
 double note_recog_ms = 10;
+double note_recog_max_ms = 500;  // how much to analyze from a waveform
 
 typedef struct {
   char *buf1, *buf2, *ptr, *end, *other;
@@ -48,6 +50,7 @@ typedef struct {
 void memfile_init (memfile *f, size_t sz) {
   f->sz = sz;
   f->buf1 = calloc (sz, 1); f->buf2 = calloc (sz, 1);
+  assert (f->buf1 != NULL && f->buf2 != NULL);
   f->ptr = f->buf1; f->end = f->ptr + f->sz; f->other = f->buf2;
   pthread_mutexattr_t lattr;
   pthread_mutexattr_init (&lattr);
@@ -58,6 +61,7 @@ void memfile_init (memfile *f, size_t sz) {
 }
 memfile *memfile_alloc (size_t sz) {
   memfile *f = malloc (sizeof (memfile));
+  assert (f != NULL);
   memfile_init (f, sz);
   return f;
 }
@@ -118,10 +122,24 @@ void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
   pthread_mutex_unlock (&trace_buf->lock);
   va_end (ap);
 }
+void trace_flush () {
+  pthread_mutex_lock (&trace_buf->switchlock);
+  memfile_switchbuf (trace_buf);
+  fprintf (stdtrace, "%s", trace_buf->other);
+  pthread_mutex_unlock (&trace_buf->switchlock);
+  fflush (stdtrace);
+}
 #define TRACE( pri, ... ) trace_msg (pri, __func__, __VA_ARGS__)
 #define TRACE_PERROR( pri, called) do {                     \
     char buf [1000]; strerror_r (errno, buf, sizeof (buf)); \
     TRACE (pri, "%s: %s", called, buf);                     \
+  } while (0)
+#define TRACE_ASSERT( cond_ ) do {                                      \
+    if (! (cond_)) {                                                    \
+      TRACE (TRACE_FATAL, "Assertion %s failed (%s:%d)",                \
+             #cond_, __FILE__, __LINE__);                               \
+      myshutdown (1);                                                   \
+    }                                                                   \
   } while (0)
 
 #if 0
@@ -150,9 +168,29 @@ typedef struct {
 enum { ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL };
 
 typedef struct {
-  sample_t level;
+  sample_t x;
   jack_nframes_t length;
 } gridpt;
+typedef struct {
+  gridpt *seq;
+  size_t length, dur;
+  int type;
+  midi_note_t note;
+} gridpt_seq;
+int gridpt_seq_type (gridpt *seq) {
+  if (seq [0].x > 0) return 0;
+  else if (seq [0].x < 0) return 1;
+  else if (seq [1].x < 0) return 2;
+  else return 3;
+}
+int gridpt_seq_cmp (const void *s1_, const void *s2_) {
+  const gridpt_seq *s1 = s1_, *s2 = s2_;
+  if      (s1->length < s2->length) return -1;
+  else if (s1->length > s2->length) return 1;
+  else if (s1->type < s2->type) return -1;
+  else if (s1->type > s2->type) return 1;
+  else return 0;
+}
 
 static const midi_note_t note_semitones [] = { 0, 2, 3, 5, 7, 8, 10, 12 };
 double note_midi2freq (midi_note_t midi) {
@@ -180,7 +218,8 @@ sigset_t sigmask;
 pthread_t poll_thread_tid = 0;
 jack_nframes_t initial_sil_frames = 0,
   wavebrk_sil_frames = 0,
-  note_recog_frames = 0;
+  note_recog_frames = 0,
+  note_recog_max_frames = 0;
 long srate = 0;
 jack_client_t *jclient = NULL;
 volatile int zombified = 0;
@@ -193,9 +232,12 @@ int jbufavail_semid; int jbufavail_valid = 0;
 sem_t jcon_sem;
 sample_t norm_noise_peak = 0;
 analyzer_state stdmidi_anls;
-double jnorm_factor = 0.0;
+sample_t jnorm_factor = 0.0;
+analyzer_state janls;
 gridpt *gridpt_buf = NULL;
-size_t gridpt_buf_max = 0, gridpt_buf_cnt = 0;
+size_t gridpt_buf_max = 0, gridpt_buf_len = 0;
+gridpt_seq *gridpt_seqdb = NULL;
+size_t gridpt_seqdb_max = 0, gridpt_seqdb_len = 0;
 
 void analyzer_state_init (analyzer_state *s) {
   memset (s, 0, sizeof (*s));
@@ -206,7 +248,7 @@ static void myshutdown (int failure);
 
 void analyze_sample (sample_t x, analyzer_state * const s) {
   s->evt = 0;
-  sample_t absx = x > 0 ? x : -x;
+  sample_t absx = fabsf (x);
   if (absx > s->max_x)
     s->max_x = absx;
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
@@ -231,9 +273,52 @@ void analyze_sample (sample_t x, analyzer_state * const s) {
     s->peak = 0.0;
   }
   ++s->voiced_ago;
-  if (s->voiced_ago >= wavebrk_sil_frames) s->evt |= (1 << ANL_EVT_SIL);
+  if (s->voiced_ago == wavebrk_sil_frames) s->evt |= (1 << ANL_EVT_SIL);
   ++s->count;
   s->x = x;
+}
+
+static int gridpt_buf_add (sample_t x, jack_nframes_t count) {
+  gridpt_buf [gridpt_buf_len].x = x;
+  gridpt_buf [gridpt_buf_len].length = count;
+  ++gridpt_buf_len; TRACE_ASSERT (gridpt_buf_len <= gridpt_buf_max);
+  TRACE (TRACE_INT + 2, "gridpt_buf_len=%d x=%f cnt=%d cover=%d/%d",
+         (int) gridpt_buf_len, (float) x, (int) count,
+         (int) (gridpt_buf [gridpt_buf_len - 1].length - gridpt_buf [0].length),
+         (int) note_recog_frames);
+  return (gridpt_buf [gridpt_buf_len - 1].length - gridpt_buf [0].length) >
+    note_recog_frames;
+}
+static void gridpt_buf_shift () {
+  memmove (gridpt_buf, gridpt_buf + 1,
+           --gridpt_buf_len * sizeof (gridpt));
+}
+static void gridpt_seq_fix_lengths (gridpt *seq, size_t len) {
+  size_t i = 0;
+  for (; i < len - 1; i++)
+    seq [i].length = seq [i + 1].length - seq [i].length;
+  seq [i].length = 0;
+}
+static void gridpt_seq_init (gridpt_seq *entry, gridpt *seq, size_t len) {
+  TRACE_ASSERT (len >= 2);
+  size_t bytes = len * sizeof (gridpt);
+  entry->seq = malloc (bytes); TRACE_ASSERT (entry->seq != NULL);
+  memcpy (entry->seq, seq, bytes);
+  entry->dur = seq [len - 1].length - seq [0].length;
+  gridpt_seq_fix_lengths (entry->seq, len);
+  entry->length = len;
+  entry->type = gridpt_seq_type (seq);
+}
+static void gridpt_seq_add (midi_note_t note) {
+  if (gridpt_seqdb_len == gridpt_seqdb_max) {
+    gridpt_seqdb_max = 1.5 * gridpt_seqdb_max;
+    gridpt_seqdb = realloc (gridpt_seqdb, gridpt_seqdb_max * sizeof (gridpt_seq));
+    TRACE_ASSERT (gridpt_seqdb != NULL);
+  }
+  gridpt_seq *entry = &gridpt_seqdb [gridpt_seqdb_len];
+  gridpt_seq_init (entry, gridpt_buf, gridpt_buf_len);
+  entry->note = note;
+  ++gridpt_seqdb_len;
 }
 
 static void process_waveform_db () {
@@ -252,8 +337,13 @@ static void process_waveform_db () {
   initial_sil_frames = srate / 100 * initial_sil_ms / 10;
   wavebrk_sil_frames = srate / 100 * wavebrk_sil_ms / 10;
   note_recog_frames = srate / 100 * note_recog_ms / 10;
-  gridpt_buf_max = srate / note_midi2freq (himidi) * 4;
-  gridpt_buf = calloc (sizeof (gridpt), gridpt_buf_max);
+  note_recog_max_frames = srate / 100 * note_recog_max_ms / 10;
+  gridpt_buf_max = note_midi2freq (himidi) * note_recog_ms / 1000 * 16;
+  gridpt_buf = malloc (sizeof (gridpt) * gridpt_buf_max);
+  TRACE_ASSERT (gridpt_buf != NULL);
+  gridpt_seqdb_max = 20000;
+  gridpt_seqdb = malloc (gridpt_seqdb_max * sizeof (gridpt_seq));
+  TRACE_ASSERT (gridpt_seqdb != NULL);
 
   double x;
   analyzer_state anls; analyzer_state_init (&anls);
@@ -279,14 +369,32 @@ static void process_waveform_db () {
                (long) my_sf_tell (dbf));
 
     sf_count_t note_pos = my_sf_tell (dbf);
+    anls.count = 1;
     analyzer_state stdanls = anls;
-    gridpt_buf_cnt = 0;
-    while ((anls.evt & (1 << ANL_EVT_SIL)) == 0) {
+    gridpt_buf_len = 0;
+    do {
+      if ((anls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0 &&
+          anls.count < note_recog_max_frames)
+      {
+        for (int part = 0; part < 2; ++part) {
+#define TEST( part, cond ) case part: if (! (cond)) continue; break
+          switch (part) {
+            TEST (0, (anls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
+                  gridpt_buf_add (anls.old_peak, anls.peak_at));
+            TEST (1, (anls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
+                  gridpt_buf_add (0, anls.count));
+          }
+#undef TEST
+          gridpt_seq_add (n);
+          gridpt_buf_shift ();
+        }
+      }
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
       analyze_sample (x, &anls);
-    }
-    TRACE (TRACE_INT + 1, "MIDI note %d Waveform ends at frame=%ld",
-               (int) n, (long) my_sf_tell (dbf));
+    } while ((anls.evt & (1 << ANL_EVT_SIL)) == 0);
+
+    TRACE (TRACE_INT + 1, "MIDI note %d Waveform ends at frame=%ld, seqs=%ld",
+           (int) n, (long) my_sf_tell (dbf), (long) gridpt_seqdb_len);
     if (n == stdmidi) {
       sf_count_t saved_pos = my_sf_tell (dbf);
       sf_seek (dbf, note_pos, SEEK_SET);
@@ -310,6 +418,9 @@ static void process_waveform_db () {
     }
   }
 
+  qsort (gridpt_seqdb, gridpt_seqdb_len, sizeof (gridpt_seqdb [0]), gridpt_seq_cmp);
+  
+  TRACE (TRACE_INFO, "%d sequences loaded from waveform db", gridpt_seqdb_len);
   return;
 
 premature:
@@ -352,6 +463,7 @@ static void *process_thread (void *arg) {
   (void) arg;
 
   int connected = 0;
+  int lost_frames = 0;
 
   for (;;) {
 
@@ -363,7 +475,7 @@ static void *process_thread (void *arg) {
     if (zombified) break;
     sample_t *in = jack_port_get_buffer (jport, nframes);
     size_t avail = jack_ringbuffer_write_space (jbuf) / sizeof (sample_t);
-    if (avail < nframes) nframes = avail;
+    if (avail < 2 * nframes) nframes = (avail < 2) ? 0 : 2;
     if (connected)
       jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
     jack_cycle_signal (jclient, 0);
@@ -372,9 +484,10 @@ static void *process_thread (void *arg) {
       struct sembuf sops1 = { .sem_num = 0, .sem_op = nframes, .sem_flg = 0 };
       semop (jbufavail_semid, &sops1, 1);
     }
-    if (nframes != nframes_orig)
+    if (! lost_frames && nframes != nframes_orig) {
+      lost_frames = 1;
       TRACE (TRACE_WARN, "Lost frames %d", (int) (nframes_orig - nframes));
-    
+    }
   }
 
   return NULL;
@@ -382,41 +495,131 @@ static void *process_thread (void *arg) {
 
 static void calibrate () {
   sample_t noise_peak;
-  analyzer_state anls;
-  analyzer_state_init (&anls);
+  analyzer_state_init (&janls);
 
   // find noise level
   TRACE (TRACE_DIAG, "Analysing noise...");
   for (jack_nframes_t i = 0; i < initial_sil_frames; i++)
-    analyze_sample (get_jsample (), &anls);
-  noise_peak = anls.noise_peak = 4 * anls.max_x;
+    analyze_sample (get_jsample (), &janls);
+  noise_peak = janls.noise_peak = 4 * janls.max_x;
   TRACE (TRACE_DIAG, "Noise peak in input: %.5f", (float) noise_peak);
 
   // skip silence
   char stdscinote [4]; note_midi2sci (stdmidi, stdscinote);
   TRACE (TRACE_IMPT, "Calibrating against note %s waveform: press note now", stdscinote);
-  while (analyze_sample (get_jsample (), &anls), anls.voiced_ago > 1);
+  while (analyze_sample (get_jsample (), &janls), janls.voiced_ago > 1);
 
   TRACE (TRACE_INT, "Found note");
-  assert (anls.npeaks == 0);
-  while (analyze_sample (get_jsample (), &anls),
-         ((anls.evt & (1 << ANL_EVT_SIL)) == 0 && anls.npeaks < stdmidi_npeaks))
+  TRACE_ASSERT (janls.npeaks == 0);
+  while (analyze_sample (get_jsample (), &janls),
+         ((janls.evt & (1 << ANL_EVT_SIL)) == 0 &&
+          janls.npeaks < stdmidi_npeaks))
   {
-    if ((anls.evt & (1 << ANL_EVT_PEAK)) != 0)
-      TRACE (TRACE_INT + 1, "Peak at frame %d %f", (int) anls.count, (float) anls.old_peak);
+    if ((janls.evt & (1 << ANL_EVT_PEAK)) != 0)
+      TRACE (TRACE_INT + 1, "Peak at frame %d %f",
+             (int) janls.count, (float) janls.old_peak);
   }
-  if (anls.max_peak_idx != stdmidi_anls.max_peak_idx) {
+  if (janls.max_peak_idx != stdmidi_anls.max_peak_idx) {
     TRACE (TRACE_FATAL, "calibration mismatch npeaks=%d %d %d %f %f",
-               anls.npeaks,
-               anls.max_peak_idx, stdmidi_anls.max_peak_idx,
-               anls.max_peak, stdmidi_anls.max_peak);
+               janls.npeaks,
+               janls.max_peak_idx, stdmidi_anls.max_peak_idx,
+               janls.max_peak, stdmidi_anls.max_peak);
     myshutdown (1);
   }
-  jnorm_factor = anls.max_peak / stdmidi_anls.max_peak;
+  jnorm_factor = stdmidi_anls.max_peak / janls.max_peak;
   TRACE (TRACE_INFO, "Scaling factor against waveform db: %f", (float) jnorm_factor);
+
+  // skip rest of note
+  while (analyze_sample (get_jsample (), &janls),
+         (janls.evt & (1 << ANL_EVT_SIL)) == 0);
+}
+
+static midi_note_t gridpt_buf_analyze () {
+  midi_note_t note = 0;
+
+  TRACE_ASSERT (gridpt_buf_len >= 2);
+  gridpt_seq gseq;
+  gridpt_seq_init (&gseq, gridpt_buf, gridpt_buf_len);
+  gridpt *seq = gseq.seq;
+  float mindist = INFINITY; size_t minidx = 0;
+
+  size_t beg = 0, end = gridpt_seqdb_len, mid = 0;
+  int rc = 0;
+  while (beg < end) {
+    mid = ((unsigned) beg + (unsigned) end) >> 1;
+    rc = gridpt_seq_cmp (&gseq, &gridpt_seqdb [mid]);
+    if (rc > 0) beg = mid + 1;
+    else if (rc < 0) end = mid;
+    else break;
+  }
+  if (rc != 0) goto ret;
+  for (beg = mid;
+       beg > 0 && gridpt_seq_cmp (&gseq, &gridpt_seqdb [beg - 1]) == 0; --beg);
+  for (end = mid + 1;
+       end < gridpt_buf_len && gridpt_seq_cmp (&gseq, &gridpt_seqdb [end]) == 0; ++end);
+  
+  for (size_t i = beg; i < end; i++) {
+    if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.1) continue;
+    sample_t dist = 0.0;
+    gridpt *seq2 = gridpt_seqdb [i].seq;
+    size_t j = 0;
+    for (; j < gridpt_buf_len; j++) {
+      sample_t x = seq [j].x;
+      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
+      size_t l = seq [j].length, l2 = seq2 [j].length;
+      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.22) goto next_seq;
+      dist += (l - l2) * (l - l2);
+    }
+    if (dist < mindist) {
+      mindist = dist;
+      minidx = i;
+    }
+  next_seq:
+    TRACE (TRACE_INT + 1, "recognizing note len=%d j=%d dist=%lf",
+           (int) gridpt_buf_len, (int) j, dist);
+  }
+
+  if (isfinite (mindist))
+    note = gridpt_seqdb [minidx].note;
+  else
+    note = 1;
+
+  goto ret;
+ret: free (seq); return note;
 }
 
 static void midi_server () {
+  midi_note_t cnote = 0;
+  TRACE (TRACE_IMPT, "MIDI server started");
+  gridpt_buf_len = 0;  
+  for (;;) {
+    analyze_sample (get_jsample () * jnorm_factor, &janls);
+    if ((janls.evt & (1 << ANL_EVT_SIL)) != 0) {
+      TRACE (TRACE_DIAG, "Silence");
+      cnote = 0;
+      gridpt_buf_len = 0;
+    }
+    if ((janls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0)
+    {
+      for (int part = 0; part < 2; part++) {
+#define TEST( part, cond ) case part: if (! (cond)) continue; break
+        switch (part) {
+          TEST (0, (janls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
+                gridpt_buf_add (janls.old_peak, janls.peak_at));
+          TEST (1, (janls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
+                gridpt_buf_add (0, janls.count));
+        }
+#undef TEST
+        // when a point is added AND completes a sequence
+        midi_note_t note = gridpt_buf_analyze ();
+        if (cnote < 1 && note != 0 && note != 1) {
+          cnote = note;
+          TRACE (TRACE_INFO, "Note %d", (int) note);
+        }
+        gridpt_buf_shift ();
+      }
+    }
+  }
 }
 
 static void on_jack_shutdown (void *arg) {
@@ -429,7 +632,7 @@ static void on_jack_shutdown (void *arg) {
 
 static void setup_audio () {
   TRACE (TRACE_INT, "jack setup");
-  fflush(stdout); fflush (stderr);
+  trace_flush (); fflush(NULL);
 
   if (-1 == (jbufavail_semid = semget (IPC_PRIVATE, 1, IPC_CREAT | S_IRUSR | S_IWUSR))) {
     TRACE_PERROR (TRACE_FATAL, "semget");
@@ -522,14 +725,6 @@ static void parse_args (char **argv) {
   }
 }
 
-void trace_flush () {
-  pthread_mutex_lock (&trace_buf->switchlock);
-  memfile_switchbuf (trace_buf);
-  fprintf (stdtrace, "%s", trace_buf->other);
-  pthread_mutex_unlock (&trace_buf->switchlock);
-  fflush (stdtrace);
-}
-
 static void *poll_thread (void *arg) {
   (void) arg;
 
@@ -543,7 +738,7 @@ static void *poll_thread (void *arg) {
 }
 
 static void init_trace () {
-  trace_buf = memfile_alloc (1 << 18);
+  trace_buf = memfile_alloc (1 << 19);
   stdtrace = fdopen (dup (fileno (stdout)), "w");
   setvbuf (stdtrace, NULL, _IONBF, 0);
   pthread_create (&poll_thread_tid, NULL, poll_thread, NULL);
@@ -584,7 +779,7 @@ static void sig_handler (int sig) {
 }
 
 void setup_sigs () {
-  int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGINT };
+  int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT };
   sigemptyset (&sigmask);
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); i++)
     sigaddset (&sigmask, sigarr [i]);
