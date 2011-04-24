@@ -39,8 +39,8 @@ int stdmidi_npeaks = 50;  /* # of peaks to read for calibration */
 int velo0 = 100;
 int initial_sil_ms = 450;
 double wavebrk_sil_ms = 1.5;
-double note_recog_ms = 10;
-double note_recog_max_ms = 500;  // how much to analyze from a waveform
+double note_recog_ms = 12;
+double note_recog_max_ms = 700;  // how much to analyze from a waveform
 
 typedef struct {
   char *buf1, *buf2, *ptr, *end, *other;
@@ -278,16 +278,17 @@ void analyze_sample (sample_t x, analyzer_state * const s) {
   s->x = x;
 }
 
-static int gridpt_buf_add (sample_t x, jack_nframes_t count) {
+size_t gridpt_buf_dur (int i) {
+  return (gridpt_buf [gridpt_buf_len - 1].length - gridpt_buf [i].length);
+}
+static float gridpt_buf_add (sample_t x, jack_nframes_t count) {
   gridpt_buf [gridpt_buf_len].x = x;
   gridpt_buf [gridpt_buf_len].length = count;
   ++gridpt_buf_len; TRACE_ASSERT (gridpt_buf_len <= gridpt_buf_max);
-  TRACE (TRACE_INT + 2, "gridpt_buf_len=%d x=%f cnt=%d cover=%d/%d",
+  TRACE (TRACE_INT + 2, "gridpt_buf_len=%d x=%f cnt=%d dur=%d/%d",
          (int) gridpt_buf_len, (float) x, (int) count,
-         (int) (gridpt_buf [gridpt_buf_len - 1].length - gridpt_buf [0].length),
-         (int) note_recog_frames);
-  return (gridpt_buf [gridpt_buf_len - 1].length - gridpt_buf [0].length) >
-    note_recog_frames;
+         (int) gridpt_buf_dur (0), (int) note_recog_frames);
+  return ((float) gridpt_buf_dur (0)) / note_recog_frames;
 }
 static void gridpt_buf_shift () {
   memmove (gridpt_buf, gridpt_buf + 1,
@@ -309,16 +310,20 @@ static void gridpt_seq_init (gridpt_seq *entry, gridpt *seq, size_t len) {
   entry->length = len;
   entry->type = gridpt_seq_type (seq);
 }
-static void gridpt_seq_add (midi_note_t note) {
+static void gridpt_seq_add (midi_note_t note, gridpt *seq, size_t len) {
   if (gridpt_seqdb_len == gridpt_seqdb_max) {
     gridpt_seqdb_max = 1.5 * gridpt_seqdb_max;
     gridpt_seqdb = realloc (gridpt_seqdb, gridpt_seqdb_max * sizeof (gridpt_seq));
     TRACE_ASSERT (gridpt_seqdb != NULL);
   }
   gridpt_seq *entry = &gridpt_seqdb [gridpt_seqdb_len];
-  gridpt_seq_init (entry, gridpt_buf, gridpt_buf_len);
+  gridpt_seq_init (entry, seq, len);
   entry->note = note;
   ++gridpt_seqdb_len;
+}
+static void gridpt_seq_add_all (midi_note_t note) {
+  for (size_t i = 0; i < gridpt_buf_len && gridpt_buf_dur (i) >= 0.9 * note_recog_frames; i++)
+    gridpt_seq_add (note, &gridpt_buf [i], gridpt_buf_len - i);
 }
 
 static void process_waveform_db () {
@@ -357,9 +362,9 @@ static void process_waveform_db () {
   TRACE (TRACE_DIAG, "Noise peak in db file: %.5f",
              (float) norm_noise_peak);
 
-  for (midi_note_t n = lomidi; n <= himidi; n++) {
+  for (midi_note_t note = lomidi; note <= himidi; ++note) {
     TRACE (TRACE_INT + 1, "Reading MIDI note %d waveform, frame=%ld",
-               (int) n, (long) my_sf_tell (dbf));
+               (int) note, (long) my_sf_tell (dbf));
     // skip silence
     while (anls.voiced_ago > 1) {
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
@@ -380,13 +385,14 @@ static void process_waveform_db () {
 #define TEST( part, cond ) case part: if (! (cond)) continue; break
           switch (part) {
             TEST (0, (anls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
-                  gridpt_buf_add (anls.old_peak, anls.peak_at));
+                  gridpt_buf_add (anls.old_peak, anls.peak_at) > 0.95);
             TEST (1, (anls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
-                  gridpt_buf_add (0, anls.count));
+                  gridpt_buf_add (0, anls.count) > 0.95);
           }
 #undef TEST
-          gridpt_seq_add (n);
-          gridpt_buf_shift ();
+          gridpt_seq_add_all (note);
+          while (gridpt_buf_dur (0) > 1.1 * note_recog_frames)
+            gridpt_buf_shift ();
         }
       }
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
@@ -394,8 +400,8 @@ static void process_waveform_db () {
     } while ((anls.evt & (1 << ANL_EVT_SIL)) == 0);
 
     TRACE (TRACE_INT + 1, "MIDI note %d Waveform ends at frame=%ld, seqs=%ld",
-           (int) n, (long) my_sf_tell (dbf), (long) gridpt_seqdb_len);
-    if (n == stdmidi) {
+           (int) note, (long) my_sf_tell (dbf), (long) gridpt_seqdb_len);
+    if (note == stdmidi) {
       sf_count_t saved_pos = my_sf_tell (dbf);
       sf_seek (dbf, note_pos, SEEK_SET);
       stdanls.npeaks = 0; stdanls.max_peak = 0; stdanls.max_peak_idx = 0;
@@ -559,16 +565,17 @@ static midi_note_t gridpt_buf_analyze () {
        end < gridpt_buf_len && gridpt_seq_cmp (&gseq, &gridpt_seqdb [end]) == 0; ++end);
   
   for (size_t i = beg; i < end; i++) {
-    if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.1) continue;
+    if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.04) continue;
     sample_t dist = 0.0;
     gridpt *seq2 = gridpt_seqdb [i].seq;
     size_t j = 0;
     for (; j < gridpt_buf_len; j++) {
       sample_t x = seq [j].x;
-      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
+      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.07) goto next_seq;
       size_t l = seq [j].length, l2 = seq2 [j].length;
-      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.22) goto next_seq;
+      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.2) goto next_seq;
       dist += (l - l2) * (l - l2);
+      if (dist > mindist) goto next_seq;
     }
     if (dist < mindist) {
       mindist = dist;
@@ -590,12 +597,12 @@ ret: free (seq); return note;
 
 static void midi_server () {
   midi_note_t cnote = 0;
-  TRACE (TRACE_IMPT, "MIDI server started");
-  gridpt_buf_len = 0;  
+  TRACE (TRACE_IMPT, "MIDI server started, delay %lf", note_recog_ms);
+  gridpt_buf_len = 0;
   for (;;) {
     analyze_sample (get_jsample () * jnorm_factor, &janls);
-    if ((janls.evt & (1 << ANL_EVT_SIL)) != 0) {
-      TRACE (TRACE_DIAG, "Silence");
+    if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != 0) {
+      TRACE (TRACE_INFO, "Note off");
       cnote = 0;
       gridpt_buf_len = 0;
     }
@@ -605,18 +612,20 @@ static void midi_server () {
 #define TEST( part, cond ) case part: if (! (cond)) continue; break
         switch (part) {
           TEST (0, (janls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
-                gridpt_buf_add (janls.old_peak, janls.peak_at));
+                gridpt_buf_add (janls.old_peak, janls.peak_at) > 1);
           TEST (1, (janls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
-                gridpt_buf_add (0, janls.count));
+                gridpt_buf_add (0, janls.count) > 1);
         }
 #undef TEST
         // when a point is added AND completes a sequence
         midi_note_t note = gridpt_buf_analyze ();
-        if (cnote < 1 && note != 0 && note != 1) {
+        if (note >= 2 && note != cnote) {
           cnote = note;
-          TRACE (TRACE_INFO, "Note %d", (int) note);
+          char scinote [4]; note_midi2sci (note, scinote);
+          TRACE (TRACE_INFO, "Note %s", scinote);
         }
-        gridpt_buf_shift ();
+        while (gridpt_buf_dur (0) > note_recog_frames)
+          gridpt_buf_shift ();
       }
     }
   }
@@ -694,6 +703,8 @@ static void parse_args (char **argv) {
         ++argv;
       } else if (0 == strcmp (*argv, "-p") || 0 == strcmp (*argv, "--port")) {
         srcport = *++argv;
+      } else if (0 == strcmp (*argv, "-d") || 0 == strcmp (*argv, "--delay")) {
+        sscanf (*++argv, "%lf", &note_recog_ms);
       } else if (0 == strcmp (*argv, "--log-level")) {
         int l; sscanf (*++argv, "%d", &l);
         TRACE (TRACE_IMPT, "Log level %d", l);
