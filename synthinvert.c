@@ -36,12 +36,14 @@ const char *srcport = NULL;
 const char *dbfname = NULL;
 midi_note_t lomidi = 0, himidi = 0;  /* range of our synth */
 midi_note_t stdmidi = 60;  /* note to calibrate against */
+midi_note_t transpose_semitones = 0;
+int note_scale [12] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 int stdmidi_npeaks = 50;  /* # of peaks to read for calibration */
 int velo0 = 100;
 int initial_sil_ms = 450;
 double wavebrk_sil_ms = 1.5;
 double note_recog_ms = 12;
-double note_recog_max_ms = 700;  // how much to analyze from a waveform
+double note_recog_max_ms = 250;  // how much to analyze from a waveform
 
 typedef struct {
   char *buf1, *buf2, *ptr, *end, *other;
@@ -151,7 +153,7 @@ void print_backtrace () {
   char **strings = backtrace_symbols (array, size);
   
   TRACE (TRACE_DIAG, "Obtained %zd stack frames", size);
-  for (size_t i = 0; i < size; i++)
+  for (size_t i = 0; i < size; ++i)
     TRACE (TRACE_DIAG, "%s", strings [i]);  
   free (strings);
 }
@@ -193,26 +195,61 @@ int gridpt_seq_cmp (const void *s1_, const void *s2_) {
   else return 0;
 }
 
-static const midi_note_t note_semitones [] = { 0, 2, 3, 5, 7, 8, 10, 12 };
+static const midi_note_t note_semitones [] = { 0, 2, 4, 5, 7, 9, 11, 12 };
 double note_midi2freq (midi_note_t midi) {
   return 27.5 * exp (.05776226504666210911 * (midi - 21));  // A0 = 27.5
 }
 void note_midi2sci (midi_note_t midi, char *sci) {
-  midi_note_t o = (midi - 21) / 12,
-    s = midi - 21 - 12 * o;
+  midi_note_t o = midi / 12 - 1, s = midi % 12;
   int sharp = 0;
   char l;
-  for (l = 'A'; l <= 'G' && note_semitones [l - 'A'] < s; l++);
-  if (note_semitones [l - 'A'] > s) { sharp = 1; l--; }
-  if (l >= 'C') o++;
+  for (l = 'C'; l <= 'I' && note_semitones [l - 'C'] < s; l++);
+  if (note_semitones [l - 'C'] > s) { sharp = 1; l--; }
+  if (l >= 'H') l += 'A' - 'H';
   sprintf (sci, "%c%d%s", l, o, sharp ? "#" : "");
 }
 midi_note_t note_sci2midi (const char *scinote) {
-  char lc = toupper (scinote [0]);
-  
-  midi_note_t l =  lc - 'A',
-    o = scinote [1] - '0' - (lc < 'C' ? 0 : 1);
-  return 21 + 12 * o + note_semitones [l];
+  if (! isalpha (scinote [0])) goto bad;
+  char ul = toupper (scinote [0]);
+
+  if (ul >= 'H') goto bad;
+  if (ul < 'C') ul += 'H' - 'A';
+  if (! isdigit (scinote [1])) goto bad;
+  midi_note_t l =  ul - 'C',
+    o = scinote [1] - '0';
+  int sharp = 0;
+  if (scinote [2] == '#') sharp = 1;
+  else if (scinote [2] == 'b') sharp = -1;
+  // else if (scinote [2] != '\0') goto bad;
+
+  return 12 * (o + 1) + note_semitones [l] + sharp;
+
+bad:
+  return (midi_note_t) -1;
+}
+int scale2bits_aux (const char *name, int *scale, midi_note_t root) {
+  for (int i = 0; i < 12; ++i) {
+    if (name [i] == '0' || name [i] == '1')
+      scale [(root + i) % 12] = name [i] == '1';
+    else return 0;
+  }
+  return 1;
+}
+int scale2bits (const char *name, int *scale) {
+  if (isdigit (name [0])) {
+    return scale2bits_aux (name, scale, 0);
+  } else if (isupper (name [0])) {
+    char sciroot [4] = { name [0], '0', '\0', '\0' };
+    if (name [1] == '#' || name [1] == 'b') sciroot [2] = name++ [1];
+    midi_note_t root = note_sci2midi (sciroot);
+    TRACE (TRACE_INT, "scale root %d", (int) root);
+    if (root == (midi_note_t) -1) return 0;
+    if (0 == strcmp (&name [1], "maj"))
+      return scale2bits_aux ("101011010101", scale, root % 12);
+    else if (0 == strcmp (&name [1], "min"))
+      return scale2bits_aux ("101101011010", scale, root % 12);
+  }
+  return 0;
 }
 
 sigset_t sigmask;
@@ -299,7 +336,7 @@ static void gridpt_buf_shift () {
 }
 static void gridpt_seq_fix_lengths (gridpt *seq, size_t len) {
   size_t i = 0;
-  for (; i < len - 1; i++)
+  for (; i < len - 1; ++i)
     seq [i].length = seq [i + 1].length - seq [i].length;
   seq [i].length = 0;
 }
@@ -325,7 +362,7 @@ static void gridpt_seq_add (midi_note_t note, gridpt *seq, size_t len) {
   ++gridpt_seqdb_len;
 }
 static void gridpt_seq_add_all (midi_note_t note) {
-  for (size_t i = 0; i < gridpt_buf_len && gridpt_buf_dur (i) >= 0.9 * note_recog_frames; i++)
+  for (size_t i = 0; i < gridpt_buf_len && gridpt_buf_dur (i) >= 0.9 * note_recog_frames; ++i)
     gridpt_seq_add (note, &gridpt_buf [i], gridpt_buf_len - i);
 }
 
@@ -357,7 +394,7 @@ static void process_waveform_db () {
   analyzer_state anls; analyzer_state_init (&anls);
 
   // find noise level in waveform db
-  for (sf_count_t i = 0; i < initial_sil_frames; i++) {
+  for (sf_count_t i = 0; i < initial_sil_frames; ++i) {
     if (sf_read_double (dbf, &x, 1) < 1) goto premature;
     analyze_sample (x, &anls);
   }
@@ -508,7 +545,7 @@ static void *process_thread (void *arg) {
     void *out = jack_port_get_buffer (jmidiport, nframes);
     jack_midi_clear_buffer (out);
     if (evtcnt > 0) {
-      for (size_t i = 0; i < evtcnt; i++)
+      for (size_t i = 0; i < evtcnt; ++i)
         jack_midi_event_write (out, 0, evt + 3 * i, sizeof (evt [0]) * 3);
     }
 
@@ -542,7 +579,7 @@ static void calibrate () {
 
   // find noise level
   TRACE (TRACE_DIAG, "Analysing noise...");
-  for (jack_nframes_t i = 0; i < initial_sil_frames; i++)
+  for (jack_nframes_t i = 0; i < initial_sil_frames; ++i)
     analyze_sample (get_jsample (), &janls);
   noise_peak = janls.noise_peak = 4 * janls.max_x;
   TRACE (TRACE_DIAG, "Noise peak in input: %.5f", (float) noise_peak);
@@ -601,8 +638,9 @@ static midi_note_t gridpt_buf_analyze () {
   for (end = mid + 1;
        end < gridpt_buf_len && gridpt_seq_cmp (&gseq, &gridpt_seqdb [end]) == 0; ++end);
   
-  for (size_t i = beg; i < end; i++) {
+  for (size_t i = beg; i < end; ++i) {
     if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.04) continue;
+    if (! note_scale [gridpt_seqdb [i].note % 12]) continue;
     sample_t dist = 0.0;
     gridpt *seq2 = gridpt_seqdb [i].seq;
     size_t j = 0;
@@ -631,7 +669,7 @@ ret: free (seq); return note;
 }
 
 void send_note (midi_note_t note, int on) {
-  char ch = note; if (on) ch |= 1 << 7;
+  char ch = note + transpose_semitones; if (on) ch |= 1 << 7;
   jack_ringbuffer_write (jmidibuf, &ch, 1);
 }
 
@@ -751,11 +789,22 @@ static void parse_args (char **argv) {
       } else if (0 == strcmp (*argv, "--range")) {
         lomidi = note_sci2midi (argv [1]);
         himidi = note_sci2midi (argv [1] + 2);
+        ASSERT (lomidi != (midi_note_t) -1 && himidi != (midi_note_t) -1);
         ++argv;
       } else if (0 == strcmp (*argv, "-p") || 0 == strcmp (*argv, "--port")) {
         srcport = *++argv;
       } else if (0 == strcmp (*argv, "-d") || 0 == strcmp (*argv, "--delay")) {
         sscanf (*++argv, "%lf", &note_recog_ms);
+      } else if (0 == strcmp (*argv, "--anl-max")) {
+        sscanf (*++argv, "%lf", &note_recog_max_ms);
+      } else if (0 == strcmp (*argv, "--transpose")) {
+        int sems; sscanf (*++argv, "%d", &sems);
+        transpose_semitones = sems;
+      } else if (0 == strcmp (*argv, "--scale")) {
+        if (0 == scale2bits (*++argv, note_scale)) {
+          TRACE (TRACE_FATAL, "unknown scale %s", *argv);
+          myshutdown (1);
+        }
       } else if (0 == strcmp (*argv, "--log-level")) {
         int l; sscanf (*++argv, "%d", &l);
         TRACE (TRACE_IMPT, "Log level %d", l);
@@ -843,12 +892,12 @@ static void sig_handler (int sig) {
 void setup_sigs () {
   int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT };
   sigemptyset (&sigmask);
-  for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); i++)
+  for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
     sigaddset (&sigmask, sigarr [i]);
   pthread_sigmask (SIG_BLOCK, &sigmask, NULL);
   struct sigaction act =
     { .sa_mask = sigmask, .sa_flags = 0, .sa_handler = sig_handler };
-  for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); i++)
+  for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
     sigaction (sigarr [i], &act, NULL);
 
 }
