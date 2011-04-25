@@ -22,6 +22,7 @@
 #include <signal.h>
 
 #include <jack/jack.h>
+#include <jack/midiport.h>
 #include <jack/ringbuffer.h>
 #include <sndfile.h>
 
@@ -134,11 +135,11 @@ void trace_flush () {
     char buf [1000]; strerror_r (errno, buf, sizeof (buf)); \
     TRACE (pri, "%s: %s", called, buf);                     \
   } while (0)
-#define TRACE_ASSERT( cond_ ) do {                                      \
+#define TRACE_ASSERT( cond_, fail ) do {                                \
     if (! (cond_)) {                                                    \
       TRACE (TRACE_FATAL, "Assertion %s failed (%s:%d)",                \
              #cond_, __FILE__, __LINE__);                               \
-      myshutdown (1);                                                   \
+      fail;                                                             \
     }                                                                   \
   } while (0)
 
@@ -224,12 +225,13 @@ long srate = 0;
 jack_client_t *jclient = NULL;
 volatile int zombified = 0;
 jack_nframes_t jmaxbufsz = 0;
-jack_port_t *jport = NULL;
-jack_ringbuffer_t *jbuf = NULL;
+jack_port_t *jport = NULL, *jmidiport = NULL;
+jack_nframes_t jbuf_len = 16384;
+jack_ringbuffer_t *jbuf = NULL, *jmidibuf = NULL;
 sample_t *jdataptr = NULL, *jdataend = NULL;
 jack_nframes_t jdatalen = 0;
 int jbufavail_semid; int jbufavail_valid = 0;
-sem_t jcon_sem;
+sem_t jcon_sem, jmidibuf_sem;
 sample_t norm_noise_peak = 0;
 analyzer_state stdmidi_anls;
 sample_t jnorm_factor = 0.0;
@@ -245,6 +247,7 @@ void analyzer_state_init (analyzer_state *s) {
 }
 
 static void myshutdown (int failure);
+#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (1));
 
 void analyze_sample (sample_t x, analyzer_state * const s) {
   s->evt = 0;
@@ -284,7 +287,7 @@ size_t gridpt_buf_dur (int i) {
 static float gridpt_buf_add (sample_t x, jack_nframes_t count) {
   gridpt_buf [gridpt_buf_len].x = x;
   gridpt_buf [gridpt_buf_len].length = count;
-  ++gridpt_buf_len; TRACE_ASSERT (gridpt_buf_len <= gridpt_buf_max);
+  ++gridpt_buf_len; ASSERT (gridpt_buf_len <= gridpt_buf_max);
   TRACE (TRACE_INT + 2, "gridpt_buf_len=%d x=%f cnt=%d dur=%d/%d",
          (int) gridpt_buf_len, (float) x, (int) count,
          (int) gridpt_buf_dur (0), (int) note_recog_frames);
@@ -301,9 +304,9 @@ static void gridpt_seq_fix_lengths (gridpt *seq, size_t len) {
   seq [i].length = 0;
 }
 static void gridpt_seq_init (gridpt_seq *entry, gridpt *seq, size_t len) {
-  TRACE_ASSERT (len >= 2);
+  ASSERT (len >= 2);
   size_t bytes = len * sizeof (gridpt);
-  entry->seq = malloc (bytes); TRACE_ASSERT (entry->seq != NULL);
+  entry->seq = malloc (bytes); ASSERT (entry->seq != NULL);
   memcpy (entry->seq, seq, bytes);
   entry->dur = seq [len - 1].length - seq [0].length;
   gridpt_seq_fix_lengths (entry->seq, len);
@@ -314,7 +317,7 @@ static void gridpt_seq_add (midi_note_t note, gridpt *seq, size_t len) {
   if (gridpt_seqdb_len == gridpt_seqdb_max) {
     gridpt_seqdb_max = 1.5 * gridpt_seqdb_max;
     gridpt_seqdb = realloc (gridpt_seqdb, gridpt_seqdb_max * sizeof (gridpt_seq));
-    TRACE_ASSERT (gridpt_seqdb != NULL);
+    ASSERT (gridpt_seqdb != NULL);
   }
   gridpt_seq *entry = &gridpt_seqdb [gridpt_seqdb_len];
   gridpt_seq_init (entry, seq, len);
@@ -345,10 +348,10 @@ static void process_waveform_db () {
   note_recog_max_frames = srate / 100 * note_recog_max_ms / 10;
   gridpt_buf_max = note_midi2freq (himidi) * note_recog_ms / 1000 * 16;
   gridpt_buf = malloc (sizeof (gridpt) * gridpt_buf_max);
-  TRACE_ASSERT (gridpt_buf != NULL);
+  ASSERT (gridpt_buf != NULL);
   gridpt_seqdb_max = 20000;
   gridpt_seqdb = malloc (gridpt_seqdb_max * sizeof (gridpt_seq));
-  TRACE_ASSERT (gridpt_seqdb != NULL);
+  ASSERT (gridpt_seqdb != NULL);
 
   double x;
   analyzer_state anls; analyzer_state_init (&anls);
@@ -441,8 +444,8 @@ sample_t get_jsample () {
   if (jdataptr == jdataend) {
     jack_ringbuffer_read_advance (jbuf, jdatalen * sizeof (sample_t));
     jdataptr = jdataend = NULL;
-    struct sembuf sops1 = { .sem_num = 0, .sem_op = -1, .sem_flg = 0 };
-    while ((rc = semop (jbufavail_semid, &sops1, 1)) == -1)
+    struct sembuf sops = { .sem_num = 0, .sem_op = -1, .sem_flg = 0 };
+    while ((rc = semop (jbufavail_semid, &sops, 1)) == -1)
       if (rc == -1 && errno != EINTR) {
         TRACE_PERROR (TRACE_FATAL, "semop");
         myshutdown (1);
@@ -453,42 +456,76 @@ sample_t get_jsample () {
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
     jdatalen = jdatainfo [0].len / sizeof (sample_t);
-    struct sembuf sops2 = { .sem_num = 0, .sem_op = -(jdatalen - 1), .sem_flg = 0 };
-    semop (jbufavail_semid, &sops2, 1);
-    if (jdatalen == 0) {
-      TRACE (TRACE_FATAL, "jdatalen=0, jdatainfo=%d", (int) jdatainfo [0].len);
+    ASSERT (jdatalen > 0);
+    if (-1 == (rc = semctl (jbufavail_semid, 0, GETVAL))) {
+      TRACE_PERROR (TRACE_FATAL, "semctl");
       myshutdown (1);
     }
+    if (jdatalen > (jack_nframes_t) ++rc) jdatalen = rc;
+
+    sops.sem_op = -(jdatalen - 1);
+    semop (jbufavail_semid, &sops, 1);
     jdataptr = (sample_t *) jdatainfo [0].buf;
     jdataend = jdataptr + jdatalen;
   }
   return *jdataptr++;
 }
 
+void pack_midi_evt (jack_midi_data_t *buf, midi_note_t note, int velo, int on) {
+  buf [0] = on ? 0x90 : 0x80;
+  buf [1] = note;
+  buf [2] = on ? velo : 0;
+  TRACE (TRACE_INT, "note=%d on=%d", (int) note, on);
+}
+
 static void *process_thread (void *arg) {
   (void) arg;
 
   int connected = 0;
-  int lost_frames = 0;
+  int rc;
+  jack_nframes_t lost_frames = 0;
 
   for (;;) {
 
-    if (! connected && sem_trywait (&jcon_sem))
+    if (! connected && 0 == sem_trywait (&jcon_sem))
       connected = 1;
 
     jack_nframes_t nframes_orig = jack_cycle_wait (jclient),
       nframes = nframes_orig;
     if (zombified) break;
-    sample_t *in = jack_port_get_buffer (jport, nframes);
-    size_t avail = jack_ringbuffer_write_space (jbuf) / sizeof (sample_t);
+
+    jack_midi_data_t evt [24];
+    size_t evtcnt = 0;
+    for (; evtcnt < sizeof (evt) / sizeof (evt [0]) / 3 
+           && 0 == sem_trywait (&jmidibuf_sem);
+         ++evtcnt)
+    {
+      char ch;
+      jack_ringbuffer_read (jmidibuf, &ch, 1);
+      pack_midi_evt (&evt [evtcnt * 3], 
+                     ch & ((1 << 7) - 1), velo0, (ch & (1 << 7)) != 0);
+    }
+    void *out = jack_port_get_buffer (jmidiport, nframes);
+    jack_midi_clear_buffer (out);
+    if (evtcnt > 0) {
+      for (size_t i = 0; i < evtcnt; i++)
+        jack_midi_event_write (out, 0, evt + 3 * i, sizeof (evt [0]) * 3);
+    }
+
+    sample_t *in = jack_port_get_buffer (jport, nframes);    
+    if (-1 == (rc = semctl (jbufavail_semid, 0, GETVAL))) {
+      TRACE_PERROR (TRACE_FATAL, "semctl");
+      break;
+    }
+    jack_nframes_t avail = jbuf_len - rc - 2;
     if (avail < 2 * nframes) nframes = (avail < 2) ? 0 : 2;
     if (connected)
       jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
     jack_cycle_signal (jclient, 0);
 
     if (connected && nframes > 0) {
-      struct sembuf sops1 = { .sem_num = 0, .sem_op = nframes, .sem_flg = 0 };
-      semop (jbufavail_semid, &sops1, 1);
+      struct sembuf sops = { .sem_num = 0, .sem_op = nframes, .sem_flg = 0 };
+      semop (jbufavail_semid, &sops, 1);
     }
     if (! lost_frames && nframes != nframes_orig) {
       lost_frames = 1;
@@ -516,7 +553,7 @@ static void calibrate () {
   while (analyze_sample (get_jsample (), &janls), janls.voiced_ago > 1);
 
   TRACE (TRACE_INT, "Found note");
-  TRACE_ASSERT (janls.npeaks == 0);
+  ASSERT (janls.npeaks == 0);
   while (analyze_sample (get_jsample (), &janls),
          ((janls.evt & (1 << ANL_EVT_SIL)) == 0 &&
           janls.npeaks < stdmidi_npeaks))
@@ -541,9 +578,9 @@ static void calibrate () {
 }
 
 static midi_note_t gridpt_buf_analyze () {
-  midi_note_t note = 0;
+  midi_note_t note = 1;
 
-  TRACE_ASSERT (gridpt_buf_len >= 2);
+  ASSERT (gridpt_buf_len >= 2);
   gridpt_seq gseq;
   gridpt_seq_init (&gseq, gridpt_buf, gridpt_buf_len);
   gridpt *seq = gseq.seq;
@@ -588,11 +625,14 @@ static midi_note_t gridpt_buf_analyze () {
 
   if (isfinite (mindist))
     note = gridpt_seqdb [minidx].note;
-  else
-    note = 1;
 
   goto ret;
 ret: free (seq); return note;
+}
+
+void send_note (midi_note_t note, int on) {
+  char ch = note; if (on) ch |= 1 << 7;
+  jack_ringbuffer_write (jmidibuf, &ch, 1);
 }
 
 static void midi_server () {
@@ -602,8 +642,9 @@ static void midi_server () {
   for (;;) {
     analyze_sample (get_jsample () * jnorm_factor, &janls);
     if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != 0) {
-      TRACE (TRACE_INFO, "Note off");
+      send_note (cnote, 0); sem_post (&jmidibuf_sem);
       cnote = 0;
+      TRACE (TRACE_INFO, "Note off");
       gridpt_buf_len = 0;
     }
     if ((janls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0)
@@ -620,7 +661,13 @@ static void midi_server () {
         // when a point is added AND completes a sequence
         midi_note_t note = gridpt_buf_analyze ();
         if (note >= 2 && note != cnote) {
-          cnote = note;
+          int cut_last = cnote != 0;
+          send_note (note, 1);
+          if (cut_last)
+            send_note (cnote, 0);
+          sem_post (&jmidibuf_sem); if (cut_last) sem_post (&jmidibuf_sem); 
+
+          cnote = note;          
           char scinote [4]; note_midi2sci (note, scinote);
           TRACE (TRACE_INFO, "Note %s", scinote);
         }
@@ -653,6 +700,7 @@ static void setup_audio () {
     TRACE_PERROR (TRACE_FATAL, "semctl");
     myshutdown (1);
   }
+  sem_init (&jmidibuf_sem, 0, 0);
   sem_init (&jcon_sem, 0, 0);
   jack_options_t jopt = 0;  // JackNoStartServer;
   jack_status_t jstat;
@@ -669,7 +717,8 @@ static void setup_audio () {
   jmaxbufsz = jack_get_buffer_size (jclient);
   TRACE (TRACE_INFO, "Connected to jack, bufsize=%d, srate=%d",
              (int) jmaxbufsz, (int) srate);
-  jbuf = jack_ringbuffer_create (16384);
+  jbuf = jack_ringbuffer_create (jbuf_len); ASSERT (jbuf != NULL);
+  jmidibuf = jack_ringbuffer_create (128); ASSERT (jmidibuf != NULL);
 
   if (0 != jack_set_process_thread (jclient, process_thread, NULL))
     goto jack_setup_fail;
@@ -677,6 +726,8 @@ static void setup_audio () {
   if (NULL == (jport = jack_port_register (jclient, "in", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0)))
     goto jack_setup_fail;
   
+  if (NULL == (jmidiport = jack_port_register (jclient, "midiout", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0)))
+    goto jack_setup_fail;
   if (0 != jack_activate (jclient))
     goto jack_setup_fail;
 
@@ -825,5 +876,25 @@ int main (int argc, char **argv) {
 }
 
 /*
-cc -std=c99 -Wall -Wextra $CFLAGS -ljack -lsndfile -lm synthinvert.c -o synthinvert
+  
+  XSI semaphores + threads aren't portable, and POSIX semaphores only increment
+  by 1.
+
+  Mutexes are subject to (possibly unbounded) priority inversion.
+
+  Pipes have an unpredictable buffer size and require syscalls.
+
+  pthread_mutex_trylock + keep an unannounced_data_count (per thread): mutex
+  may happen to be taken when queried until reader exhausts data. We could
+  use a thread-local ringbuffer to store unannounced data.
+
+  Unsynchronized "single-writer" paradigm issues: atomicity of pointers, cache
+  coherency, compiler / pipeline write reordering.
+
+*/
+
+/*
+  Compile with:
+  
+  cc -std=c99 -D_REENTRANT -Wall -Wextra $CFLAGS -ljack -lsndfile -lm synthinvert.c -o synthinvert
 */
