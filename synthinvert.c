@@ -28,6 +28,8 @@
 
 #define MYNAME "synthinvert"
 
+#define SQR( x ) ((x) * (x))
+
 typedef int midi_note_t;  /* 0-127, 21=A0, 60=C4 */
 #define MIDI_NOTE_NONE ((midi_note_t) -1)
 typedef jack_default_audio_sample_t sample_t;
@@ -170,7 +172,7 @@ typedef struct {
   sample_t x, peak, old_peak, max_x, max_peak, noise_peak;
   jack_nframes_t count, voiced_ago, peak_at;
   int evt;
-} analyzer_state;
+} sample_anl_state;
 enum { ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL };
 
 typedef struct {
@@ -273,15 +275,15 @@ jack_nframes_t jdatalen = 0;
 int jbufavail_semid; int jbufavail_valid = 0;
 sem_t jcon_sem, jmidibuf_sem;
 sample_t norm_noise_peak = 0;
-analyzer_state stdmidi_anls;
+sample_anl_state stdmidi_anls;
 sample_t jnorm_factor = 0.0;
-analyzer_state janls;
+sample_anl_state janls;
 gridpt *gridpt_buf = NULL;
 size_t gridpt_buf_max = 0, gridpt_buf_len = 0;
 gridpt_seq *gridpt_seqdb = NULL;
 size_t gridpt_seqdb_max = 0, gridpt_seqdb_len = 0;
 
-void analyzer_state_init (analyzer_state *s) {
+void sample_anl_state_init (sample_anl_state *s) {
   memset (s, 0, sizeof (*s));
   s->voiced_ago = 15 * srate;
 }
@@ -289,7 +291,7 @@ void analyzer_state_init (analyzer_state *s) {
 static void myshutdown (int failure);
 #define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (1));
 
-void analyze_sample (sample_t x, analyzer_state * const s) {
+void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->evt = 0;
   sample_t absx = fabsf (x);
   if (absx > s->max_x)
@@ -394,7 +396,7 @@ static void process_waveform_db () {
   ASSERT (gridpt_seqdb != NULL);
 
   double x;
-  analyzer_state anls; analyzer_state_init (&anls);
+  sample_anl_state anls; sample_anl_state_init (&anls);
 
   // find noise level in waveform db
   for (sf_count_t i = 0; i < initial_sil_frames; ++i) {
@@ -418,7 +420,7 @@ static void process_waveform_db () {
 
     sf_count_t note_pos = my_sf_tell (dbf);
     anls.count = 1;
-    analyzer_state stdanls = anls;
+    sample_anl_state stdanls = anls;
     gridpt_buf_len = 0;
     do {
       if ((anls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0 &&
@@ -578,7 +580,7 @@ static void *process_thread (void *arg) {
 
 static void calibrate () {
   sample_t noise_peak;
-  analyzer_state_init (&janls);
+  sample_anl_state_init (&janls);
 
   // find noise level
   TRACE (TRACE_DIAG, "Analysing noise...");
@@ -617,14 +619,23 @@ static void calibrate () {
          (janls.evt & (1 << ANL_EVT_SIL)) == 0);
 }
 
-static midi_note_t gridpt_buf_analyze () {
-  midi_note_t note = 1;
+typedef struct {
+  midi_note_t note;
+  float dist;
+} gpb_anl_state;
+void gpb_anl_state_init (gpb_anl_state *s) {
+  s->note = MIDI_NOTE_NONE;
+  s->dist = INFINITY;
+}
+static midi_note_t gridpt_buf_analyze (gpb_anl_state *state) {
+  midi_note_t note = MIDI_NOTE_NONE;
 
   ASSERT (gridpt_buf_len >= 2);
   gridpt_seq gseq;
   gridpt_seq_init (&gseq, gridpt_buf, gridpt_buf_len);
   gridpt *seq = gseq.seq;
-  float mindist = INFINITY; size_t minidx = 0;
+  float mindist = INFINITY, mindist_cnote = INFINITY;
+  size_t minidx = 0;
 
   size_t beg = 0, end = gridpt_seqdb_len, mid = 0;
   int rc = 0;
@@ -642,31 +653,44 @@ static midi_note_t gridpt_buf_analyze () {
        end < gridpt_buf_len && gridpt_seq_cmp (&gseq, &gridpt_seqdb [end]) == 0; ++end);
   
   for (size_t i = beg; i < end; ++i) {
-    if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.04) continue;
-    if (! note_scale [gridpt_seqdb [i].note % 12]) continue;
+    if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.03) continue;
+    midi_note_t newnote = gridpt_seqdb [i].note;
+    if (! note_scale [newnote % 12]) continue;
+    float dscale = (float) gridpt_buf_len / SQR (gridpt_seqdb [i].dur);
     sample_t dist = 0.0;
     gridpt *seq2 = gridpt_seqdb [i].seq;
     size_t j = 0;
     for (; j < gridpt_buf_len; j++) {
       sample_t x = seq [j].x;
-      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.07) goto next_seq;
-      size_t l = seq [j].length, l2 = seq2 [j].length;
-      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.2) goto next_seq;
-      dist += (l - l2) * (l - l2);
-      if (dist > mindist) goto next_seq;
+      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
+      jack_nframes_t l = seq [j].length, l2 = seq2 [j].length;
+      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.15) goto next_seq;
+      dist += SQR (l - l2) * dscale;
+      if (newnote != state->note && dist > mindist) goto next_seq;
     }
     if (dist < mindist) {
       mindist = dist;
       minidx = i;
     }
+    if (newnote == state->note && dist < mindist_cnote)
+      mindist_cnote = dist;
   next_seq:
     if (dist > 0.0)
-      TRACE (TRACE_INT + 1, "recognizing note len=%d j=%d dist=%lf",
-             (int) gridpt_buf_len, (int) j, dist);
+      TRACE (TRACE_INT + 1, "recognizing note j=%d/%d dist=%lf",
+             (int) j, (int) gridpt_buf_len, dist);
   }
 
-  if (isfinite (mindist))
-    note = gridpt_seqdb [minidx].note;
+  if (isinf (mindist_cnote) && isfinite (state->dist))
+    mindist_cnote = state->dist = state->dist * 4;
+  else if (isfinite (mindist_cnote) && mindist_cnote > state->dist)
+    mindist_cnote = state->dist = 0.1 * state->dist + 0.9 * mindist_cnote;
+  if (isfinite (mindist)) {
+    midi_note_t minnote = gridpt_seqdb [minidx].note;
+    if (minnote == state->note || mindist * 1.01 <= mindist_cnote) {
+      note = state->note = minnote;
+      state->dist = mindist;
+    } else TRACE (TRACE_INT, "mindist %f mindist_cnote %f", mindist, mindist_cnote);
+  }
 
   goto ret;
 ret: free (seq); return note;
@@ -679,6 +703,8 @@ void send_note (midi_note_t note, int on) {
 
 static void midi_server () {
   midi_note_t cnote = 0;
+  gpb_anl_state gpbs;
+  gpb_anl_state_init (&gpbs);
   TRACE (TRACE_IMPT, "MIDI server started, delay %lf", note_recog_ms);
   gridpt_buf_len = 0;
   for (;;) {
@@ -686,6 +712,7 @@ static void midi_server () {
     if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != 0) {
       send_note (cnote, 0); sem_post (&jmidibuf_sem);
       cnote = 0;
+      gpb_anl_state_init (&gpbs);
       TRACE (TRACE_INFO, "Note off");
       gridpt_buf_len = 0;
     }
@@ -701,8 +728,8 @@ static void midi_server () {
         }
 #undef TEST
         // when a point is added AND completes a sequence
-        midi_note_t note = gridpt_buf_analyze ();
-        if (note >= 2 && note != cnote) {
+        midi_note_t note = gridpt_buf_analyze (&gpbs);
+        if (note != MIDI_NOTE_NONE && note != cnote) {
           int cut_last = cnote != 0;
           send_note (note, 1);
           if (cut_last)
@@ -725,7 +752,6 @@ static void on_jack_shutdown (void *arg) {
 
   zombified = 1;
   TRACE (TRACE_FATAL, "Jack shut us down");
-  myshutdown (1);
 }
 
 static void setup_audio () {
