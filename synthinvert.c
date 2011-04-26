@@ -26,7 +26,10 @@
 #include <jack/ringbuffer.h>
 #include <sndfile.h>
 
+#define MYNAME "synthinvert"
+
 typedef int midi_note_t;  /* 0-127, 21=A0, 60=C4 */
+#define MIDI_NOTE_NONE ((midi_note_t) -1)
 typedef jack_default_audio_sample_t sample_t;
 typedef union {
   int val; struct semid_ds *buf; unsigned short  *array;
@@ -91,9 +94,9 @@ int memfile_printf (memfile *f, const char *fmt, ...) {
 }
 
 typedef enum {
-  TRACE_FATAL, TRACE_ERR, TRACE_WARN, TRACE_IMPT, TRACE_INFO, TRACE_DIAG, TRACE_INT
+  TRACE_NONE, TRACE_FATAL, TRACE_ERR, TRACE_WARN, TRACE_IMPT, TRACE_INFO, TRACE_DIAG, TRACE_INT
 } trace_pri_t;
-const char *trace_level_symb = "FEW!ID          ";
+const char *trace_level_symb = "-FEW!ID          ";
 trace_pri_t trace_level = TRACE_INT;
 int trace_print_tid = 0, trace_print_fn = 0;
 memfile *trace_buf = NULL;
@@ -225,7 +228,7 @@ midi_note_t note_sci2midi (const char *scinote) {
   return 12 * (o + 1) + note_semitones [l] + sharp;
 
 bad:
-  return (midi_note_t) -1;
+  return MIDI_NOTE_NONE;
 }
 int scale2bits_aux (const char *name, int *scale, midi_note_t root) {
   for (int i = 0; i < 12; ++i) {
@@ -243,7 +246,7 @@ int scale2bits (const char *name, int *scale) {
     if (name [1] == '#' || name [1] == 'b') sciroot [2] = name++ [1];
     midi_note_t root = note_sci2midi (sciroot);
     TRACE (TRACE_INT, "scale root %d", (int) root);
-    if (root == (midi_note_t) -1) return 0;
+    if (root == MIDI_NOTE_NONE) return 0;
     if (0 == strcmp (&name [1], "maj"))
       return scale2bits_aux ("101011010101", scale, root % 12);
     else if (0 == strcmp (&name [1], "min"))
@@ -383,7 +386,7 @@ static void process_waveform_db () {
   wavebrk_sil_frames = srate / 100 * wavebrk_sil_ms / 10;
   note_recog_frames = srate / 100 * note_recog_ms / 10;
   note_recog_max_frames = srate / 100 * note_recog_max_ms / 10;
-  gridpt_buf_max = note_midi2freq (himidi) * note_recog_ms / 1000 * 16;
+  gridpt_buf_max = note_midi2freq (himidi) * note_recog_ms / 1000 * 64;
   gridpt_buf = malloc (sizeof (gridpt) * gridpt_buf_max);
   ASSERT (gridpt_buf != NULL);
   gridpt_seqdb_max = 20000;
@@ -657,8 +660,9 @@ static midi_note_t gridpt_buf_analyze () {
       minidx = i;
     }
   next_seq:
-    TRACE (TRACE_INT + 1, "recognizing note len=%d j=%d dist=%lf",
-           (int) gridpt_buf_len, (int) j, dist);
+    if (dist > 0.0)
+      TRACE (TRACE_INT + 1, "recognizing note len=%d j=%d dist=%lf",
+             (int) gridpt_buf_len, (int) j, dist);
   }
 
   if (isfinite (mindist))
@@ -781,32 +785,73 @@ jack_setup_fail:
   myshutdown (1);
 }
 
+void usage (const char *fmt, ...) {
+#define NL "\n"
+  if (fmt != NULL) {
+    printf ("Error: ");
+    va_list ap; va_start (ap, fmt);
+    vprintf (fmt, ap);
+    va_end (ap);
+    printf ("\n\n");
+  }
+  printf ("%s\n",
+   "Usage: " MYNAME " -r RANGE -f FILE -p JACKPORT -d DELAY [OPTIONS]"
+NL "  or:  " MYNAME " { -h | --help | -? | --version }"
+NL
+NL "Options:"
+NL "  -p, --port JP      Jack audio port to listen on (e.g. system:capture_1)"
+NL "  -f, --db FILE      Training recording from synth"
+NL "  -r, --range RANGE  Range of notes in training file (e.g. F2-C5)"
+NL "  --transpose SEMIT  Semitones to transpose (e.g. -12)"
+NL "  --scale S          Scale restriction (e.g. C#min, EbMaj)"
+NL "  --log-level N      Log level (higher = more details, defaults to 4)"
+          );
+#undef NL
+  
+  trace_level = TRACE_NONE;
+  exit (fmt == NULL ? EXIT_SUCCESS : EXIT_FAILURE);
+}
+
 static void parse_args (char **argv) {
+  if (argv [0] == NULL) usage (NULL);
   for (++argv; *argv != NULL; ++argv) {
     if (*argv [0] == '-') {
-      if (0 == strcmp (*argv, "--db")) {
+      if (0 == strcmp (*argv, "-h") || 0 == strcmp (*argv, "--help") ||
+          0 == strcmp (*argv, "-?"))
+      {
+        usage (NULL);
+      } else if (0 == strcmp (*argv, "--version")) {
+        printf ("%s version %s\n%s\n", MYNAME, "1.0", "Copyright (C) 2010-2011 Dan Muresan");
+        exit (EXIT_SUCCESS);
+      } else if (0 == strcmp (*argv, "-f") || 0 == strcmp (*argv, "--db")) {
         dbfname = *++argv;
-      } else if (0 == strcmp (*argv, "--range")) {
+      } else if (0 == strcmp (*argv, "-r") || 0 == strcmp (*argv, "--range")) {
+        char *ptrhi = strchr (argv [1], '-');
+        if (ptrhi == NULL) usage ("Bad note range %s", argv [1]);
         lomidi = note_sci2midi (argv [1]);
-        himidi = note_sci2midi (argv [1] + 2);
-        ASSERT (lomidi != (midi_note_t) -1 && himidi != (midi_note_t) -1);
+        if (lomidi == MIDI_NOTE_NONE) usage ("Bad note %s", argv [1]);
+        *ptrhi++ = '\0'; himidi = note_sci2midi (ptrhi);
+        if (himidi == MIDI_NOTE_NONE) usage ("Bad note %s", ptrhi);
         ++argv;
       } else if (0 == strcmp (*argv, "-p") || 0 == strcmp (*argv, "--port")) {
         srcport = *++argv;
       } else if (0 == strcmp (*argv, "-d") || 0 == strcmp (*argv, "--delay")) {
-        sscanf (*++argv, "%lf", &note_recog_ms);
+        if (sscanf (*++argv, "%lf", &note_recog_ms) != 1)
+          usage ("Bad delay %s", *argv);
       } else if (0 == strcmp (*argv, "--anl-max")) {
         sscanf (*++argv, "%lf", &note_recog_max_ms);
       } else if (0 == strcmp (*argv, "--transpose")) {
-        int sems; sscanf (*++argv, "%d", &sems);
+        int sems;
+        if (sscanf (*++argv, "%d", &sems) != 1)
+          usage ("Bad semitone count %s", *argv);
         transpose_semitones = sems;
       } else if (0 == strcmp (*argv, "--scale")) {
-        if (0 == scale2bits (*++argv, note_scale)) {
-          TRACE (TRACE_FATAL, "unknown scale %s", *argv);
-          myshutdown (1);
-        }
+        if (0 == scale2bits (*++argv, note_scale))
+          usage ("unknown scale %s", *argv);
       } else if (0 == strcmp (*argv, "--log-level")) {
-        int l; sscanf (*++argv, "%d", &l);
+        int l;
+        if (sscanf (*++argv, "%d", &l) != 1)
+          usage ("Bad log level %s", *argv);
         TRACE (TRACE_IMPT, "Log level %d", l);
         trace_level = l;
       } else if (0 == strcmp (*argv, "--log-tid")) {
@@ -823,11 +868,11 @@ static void parse_args (char **argv) {
     myshutdown (1);
   }
   if (0 == himidi) {
-    TRACE (TRACE_FATAL, "note range (e.g. --range G2C5) not specified");
+    TRACE (TRACE_FATAL, "note range (e.g. --range F2-C5) not specified");
     myshutdown (1);
   }
   if (lomidi > stdmidi || stdmidi > himidi) {
-    TRACE (TRACE_FATAL, "calibration note out of range");
+    TRACE (TRACE_FATAL, "calibration MIDI note %d out of range", (int) stdmidi);
     myshutdown (1);
   }
   if (NULL == srcport) {
