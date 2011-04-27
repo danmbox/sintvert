@@ -365,9 +365,88 @@ static void gridpt_seq_add (midi_note_t note, gridpt *seq, size_t len) {
   entry->note = note;
   ++gridpt_seqdb_len;
 }
-static void gridpt_seq_add_all (midi_note_t note) {
-  for (size_t i = 0; i < gridpt_buf_len && gridpt_buf_dur (i) >= 0.9 * note_recog_frames; ++i)
+static void gridpt_seq_add_all (midi_note_t note, jack_nframes_t minframes) {
+  for (size_t i = 0; i < gridpt_buf_len && gridpt_buf_dur (i) >= minframes; ++i)
     gridpt_seq_add (note, &gridpt_buf [i], gridpt_buf_len - i);
+}
+
+typedef struct {
+  midi_note_t note;
+  float dist;
+} gpb_anl_state;
+void gpb_anl_state_init (gpb_anl_state *s) {
+  s->note = MIDI_NOTE_NONE;
+  s->dist = INFINITY;
+}
+static midi_note_t gridpt_buf_analyze (gpb_anl_state *state) {
+  midi_note_t note = MIDI_NOTE_NONE;
+
+  ASSERT (gridpt_buf_len >= 2);
+  gridpt_seq gseq;
+  gridpt_seq_init (&gseq, gridpt_buf, gridpt_buf_len);
+  gridpt *seq = gseq.seq;
+  float mindist = INFINITY, mindist_cnote = INFINITY;
+  size_t minidx = 0;
+
+  size_t beg = 0, end = gridpt_seqdb_len, mid = 0;
+  int rc = 0;
+  while (beg < end) {
+    mid = ((unsigned) beg + (unsigned) end) >> 1;
+    rc = gridpt_seq_cmp (&gseq, &gridpt_seqdb [mid]);
+    if (rc > 0) beg = mid + 1;
+    else if (rc < 0) end = mid;
+    else break;
+  }
+  if (rc != 0) goto ret;
+  for (beg = mid;
+       beg > 0 && gridpt_seq_cmp (&gseq, &gridpt_seqdb [beg - 1]) == 0; --beg);
+  for (end = mid + 1;
+       end < gridpt_buf_len && gridpt_seq_cmp (&gseq, &gridpt_seqdb [end]) == 0; ++end);
+  
+  for (size_t i = beg; i < end; ++i) {
+    if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.03) continue;
+    midi_note_t newnote = gridpt_seqdb [i].note;
+    if (! note_scale [newnote % 12]) continue;
+    float dscale = (double) SQR (gridpt_seqdb [i].dur) / (gridpt_buf_len - 1);
+    sample_t dist = 0.0;
+    gridpt *seq2 = gridpt_seqdb [i].seq;
+    size_t j = 0;
+    for (; j < gridpt_buf_len; j++) {
+      sample_t x = seq [j].x;
+      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
+      jack_nframes_t l = seq [j].length, l2 = seq2 [j].length;
+      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.15) goto next_seq;
+      dist += SQR (l - l2) / dscale;
+      if (newnote != state->note && dist > mindist) goto next_seq;
+    }
+    if (dist < mindist) {
+      mindist = dist;
+      minidx = i;
+    }
+    if (newnote == state->note && dist < mindist_cnote)
+      mindist_cnote = dist;
+  next_seq:
+    if (dist > 0.0)
+      TRACE (TRACE_INT + 1, "recognizing note j=%d/%d dist=%lf",
+             (int) j, (int) gridpt_buf_len, dist);
+  }
+
+  if (isinf (mindist_cnote) && isfinite (state->dist))
+    mindist_cnote = state->dist = state->dist * 5;
+  else if (isfinite (mindist_cnote) && mindist_cnote > state->dist)
+    mindist_cnote = state->dist = 0.2 * state->dist + 0.8 * mindist_cnote;
+  if (isfinite (mindist)) {
+    midi_note_t minnote = gridpt_seqdb [minidx].note;
+    if (minnote == state->note || mindist * 1.02 <= mindist_cnote) {
+      note = state->note = minnote;
+      state->dist = mindist;
+    }
+    TRACE (TRACE_INT, "minnote %d dist %f dist_cnote %f dur=%d",
+           (int) minnote, mindist, mindist_cnote, gseq.dur);
+  }
+
+  goto ret;
+ret: free (seq); return note;
 }
 
 static void process_waveform_db () {
@@ -407,6 +486,8 @@ static void process_waveform_db () {
              (float) norm_noise_peak);
 
   for (midi_note_t note = lomidi; note <= himidi; ++note) {
+    double note_period = 1 / note_midi2freq (note);
+    
     TRACE (TRACE_INT + 1, "Reading MIDI note %d waveform, frame=%ld",
                (int) note, (long) my_sf_tell (dbf));
     // skip silence
@@ -434,9 +515,9 @@ static void process_waveform_db () {
                   gridpt_buf_add (0, anls.count) > 0.95);
           }
 #undef TEST
-          while (gridpt_buf_dur (0) > 1.1 * note_recog_frames)
+          while (gridpt_buf_dur (0) > (note_recog_frames + note_period * srate / 4) * 1.05)
             gridpt_buf_shift ();
-          gridpt_seq_add_all (note);
+          gridpt_seq_add_all (note, 0.95 * note_recog_frames);
         }
       }
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
@@ -616,84 +697,6 @@ static void calibrate () {
   // skip rest of note
   while (analyze_sample (get_jsample (), &janls),
          (janls.evt & (1 << ANL_EVT_SIL)) == 0);
-}
-
-typedef struct {
-  midi_note_t note;
-  float dist;
-} gpb_anl_state;
-void gpb_anl_state_init (gpb_anl_state *s) {
-  s->note = MIDI_NOTE_NONE;
-  s->dist = INFINITY;
-}
-static midi_note_t gridpt_buf_analyze (gpb_anl_state *state) {
-  midi_note_t note = MIDI_NOTE_NONE;
-
-  ASSERT (gridpt_buf_len >= 2);
-  gridpt_seq gseq;
-  gridpt_seq_init (&gseq, gridpt_buf, gridpt_buf_len);
-  gridpt *seq = gseq.seq;
-  float mindist = INFINITY, mindist_cnote = INFINITY;
-  size_t minidx = 0;
-
-  size_t beg = 0, end = gridpt_seqdb_len, mid = 0;
-  int rc = 0;
-  while (beg < end) {
-    mid = ((unsigned) beg + (unsigned) end) >> 1;
-    rc = gridpt_seq_cmp (&gseq, &gridpt_seqdb [mid]);
-    if (rc > 0) beg = mid + 1;
-    else if (rc < 0) end = mid;
-    else break;
-  }
-  if (rc != 0) goto ret;
-  for (beg = mid;
-       beg > 0 && gridpt_seq_cmp (&gseq, &gridpt_seqdb [beg - 1]) == 0; --beg);
-  for (end = mid + 1;
-       end < gridpt_buf_len && gridpt_seq_cmp (&gseq, &gridpt_seqdb [end]) == 0; ++end);
-  
-  for (size_t i = beg; i < end; ++i) {
-    if (fabs ((float) gridpt_seqdb [i].dur / gseq.dur - 1) > 0.03) continue;
-    midi_note_t newnote = gridpt_seqdb [i].note;
-    if (! note_scale [newnote % 12]) continue;
-    float dscale = (float) gridpt_buf_len / SQR (gridpt_seqdb [i].dur);
-    sample_t dist = 0.0;
-    gridpt *seq2 = gridpt_seqdb [i].seq;
-    size_t j = 0;
-    for (; j < gridpt_buf_len; j++) {
-      sample_t x = seq [j].x;
-      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
-      jack_nframes_t l = seq [j].length, l2 = seq2 [j].length;
-      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.15) goto next_seq;
-      dist += SQR (l - l2) * dscale;
-      if (newnote != state->note && dist > mindist) goto next_seq;
-    }
-    if (dist < mindist) {
-      mindist = dist;
-      minidx = i;
-    }
-    if (newnote == state->note && dist < mindist_cnote)
-      mindist_cnote = dist;
-  next_seq:
-    if (dist > 0.0)
-      TRACE (TRACE_INT + 1, "recognizing note j=%d/%d dist=%lf",
-             (int) j, (int) gridpt_buf_len, dist);
-  }
-
-  if (isinf (mindist_cnote) && isfinite (state->dist))
-    mindist_cnote = state->dist = state->dist * 8;
-  else if (isfinite (mindist_cnote) && mindist_cnote > state->dist)
-    mindist_cnote = state->dist = 0.2 * state->dist + 0.8 * mindist_cnote;
-  if (isfinite (mindist)) {
-    midi_note_t minnote = gridpt_seqdb [minidx].note;
-    if (minnote == state->note || mindist * 1.02 <= mindist_cnote) {
-      note = state->note = minnote;
-      state->dist = mindist;
-    }
-    TRACE (TRACE_INT, "minnote %d dist %f dist_cnote %f", (int) minnote, mindist, mindist_cnote);
-  }
-
-  goto ret;
-ret: free (seq); return note;
 }
 
 void send_note (midi_note_t note, int on) {
