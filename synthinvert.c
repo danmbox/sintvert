@@ -340,10 +340,9 @@ static void gridpt_buf_shift () {
            --gridpt_buf_len * sizeof (gridpt));
 }
 static void gridpt_seq_fix_lengths (gridpt *seq, size_t len) {
-  size_t i = 0;
-  for (; i < len - 1; ++i)
-    seq [i].length = seq [i + 1].length - seq [i].length;
-  seq [i].length = 0;
+  size_t i = len;
+  for (; i > 0; --i)
+    seq [i - 1].length -= seq [0].length;
 }
 static void gridpt_seq_init (gridpt_seq *entry, gridpt *seq, size_t len) {
   ASSERT (len >= 2);
@@ -435,9 +434,9 @@ static void process_waveform_db () {
                   gridpt_buf_add (0, anls.count) > 0.95);
           }
 #undef TEST
-          gridpt_seq_add_all (note);
           while (gridpt_buf_dur (0) > 1.1 * note_recog_frames)
             gridpt_buf_shift ();
+          gridpt_seq_add_all (note);
         }
       }
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
@@ -681,15 +680,16 @@ static midi_note_t gridpt_buf_analyze (gpb_anl_state *state) {
   }
 
   if (isinf (mindist_cnote) && isfinite (state->dist))
-    mindist_cnote = state->dist = state->dist * 4;
+    mindist_cnote = state->dist = state->dist * 8;
   else if (isfinite (mindist_cnote) && mindist_cnote > state->dist)
-    mindist_cnote = state->dist = 0.1 * state->dist + 0.9 * mindist_cnote;
+    mindist_cnote = state->dist = 0.2 * state->dist + 0.8 * mindist_cnote;
   if (isfinite (mindist)) {
     midi_note_t minnote = gridpt_seqdb [minidx].note;
-    if (minnote == state->note || mindist * 1.01 <= mindist_cnote) {
+    if (minnote == state->note || mindist * 1.02 <= mindist_cnote) {
       note = state->note = minnote;
       state->dist = mindist;
-    } else TRACE (TRACE_INT, "mindist %f mindist_cnote %f", mindist, mindist_cnote);
+    }
+    TRACE (TRACE_INT, "minnote %d dist %f dist_cnote %f", (int) minnote, mindist, mindist_cnote);
   }
 
   goto ret;
@@ -728,6 +728,8 @@ static void midi_server () {
         }
 #undef TEST
         // when a point is added AND completes a sequence
+        while (gridpt_buf_dur (1) > note_recog_frames)
+          gridpt_buf_shift ();
         midi_note_t note = gridpt_buf_analyze (&gpbs);
         if (note != MIDI_NOTE_NONE && note != cnote) {
           int cut_last = cnote != 0;
@@ -740,8 +742,6 @@ static void midi_server () {
           char scinote [4]; note_midi2sci (note, scinote);
           TRACE (TRACE_INFO, "Note %s", scinote);
         }
-        while (gridpt_buf_dur (0) > note_recog_frames)
-          gridpt_buf_shift ();
       }
     }
   }
