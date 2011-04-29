@@ -663,6 +663,10 @@ static void *process_thread (void *arg) {
     jack_nframes_t nframes_orig = jack_cycle_wait (jclient),
       nframes = nframes_orig;
     if (zombified) break;
+    if (! connected) {
+      jack_cycle_signal (jclient, 0);
+      continue;
+    }
 
     jack_midi_data_t evt [24];
     size_t evtcnt = 0;
@@ -689,11 +693,11 @@ static void *process_thread (void *arg) {
     }
     jack_nframes_t avail = jbuf_len - rc - 2;
     if (avail < 2 * nframes) nframes = (avail < 2) ? 0 : 2;
-    if (connected)
-      jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
+    jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
+
     jack_cycle_signal (jclient, 0);
 
-    if (connected && nframes > 0) {
+    if (nframes > 0) {
       struct sembuf sops = { .sem_num = 0, .sem_op = nframes, .sem_flg = 0 };
       semop (jbufavail_semid, &sops, 1);
     }
@@ -840,7 +844,7 @@ static void setup_audio () {
   jmaxbufsz = jack_get_buffer_size (jclient);
   TRACE (TRACE_INFO, "Connected to jack, bufsize=%d, srate=%d",
              (int) jmaxbufsz, (int) srate);
-  jbuf = jack_ringbuffer_create (jbuf_len); ASSERT (jbuf != NULL);
+  jbuf = jack_ringbuffer_create (jbuf_len * sizeof (sample_t)); ASSERT (jbuf != NULL);
   jmidibuf = jack_ringbuffer_create (128); ASSERT (jmidibuf != NULL);
 
   if (0 != jack_set_process_thread (jclient, process_thread, NULL))
