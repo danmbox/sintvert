@@ -164,10 +164,10 @@ void print_backtrace () {
   void *array[30];
   size_t size = backtrace (array, 30);
   char **strings = backtrace_symbols (array, size);
-  
+
   TRACE (TRACE_DIAG, "Obtained %zd stack frames", size);
   for (size_t i = 0; i < size; ++i)
-    TRACE (TRACE_DIAG, "%s", strings [i]);  
+    TRACE (TRACE_DIAG, "%s", strings [i]);
   free (strings);
 }
 #endif
@@ -192,14 +192,14 @@ typedef struct {
   size_t length, dur;
   int type;
   midi_note_t note;
-} gridpt_seq;
-int gridpt_seq_type (gridpt *seq) {
+} gpt_seq;
+int gpt_seq_type (gridpt *seq) {
   if (seq [0].x > 0) return 0;
   else if (seq [0].x < 0) return 1;
   else if (seq [1].x < 0) return 2;
   else return 3;
 }
-static char *gridpt_seq_dump (const gridpt_seq *gseq, char *buf, size_t sz) {
+static char *gpt_seq_dump (const gpt_seq *gseq, char *buf, size_t sz) {
   static char buf_ [256]; if (buf == NULL) { buf = buf_; sz = sizeof (buf_); }
   memfile mf; memfile_init (&mf, sz, buf);
   memfile_printf (&mf, "l=%d t=%d dur=%d note=%d",
@@ -208,15 +208,15 @@ static char *gridpt_seq_dump (const gridpt_seq *gseq, char *buf, size_t sz) {
     memfile_printf (&mf, " (%f %d)", gseq->seq [i].x, gseq->seq [i].framecnt);
   return buf;
 }
-int gridpt_seq_cmp1 (const gridpt_seq *s1, const gridpt_seq *s2) {
+int gpt_seq_cmp1 (const gpt_seq *s1, const gpt_seq *s2) {
   if      (s1->length < s2->length) return -1;
   else if (s1->length > s2->length) return 1;
   else if (s1->type < s2->type) return -1;
   else if (s1->type > s2->type) return 1;
   else return 0;
 }
-int gridpt_seq_cmp (const gridpt_seq *s1, const gridpt_seq *s2) {
-  int rc1 = gridpt_seq_cmp1 (s1, s2);
+int gpt_seq_cmp (const gpt_seq *s1, const gpt_seq *s2) {
+  int rc1 = gpt_seq_cmp1 (s1, s2);
   if      (rc1 != 0) return rc1;
   else if (s1->dur < s2->dur) return -1;
   else if (s1->dur > s2->dur) return 1;
@@ -301,10 +301,10 @@ sample_t norm_noise_peak = 0;
 sample_anl_state stdmidi_anls;
 sample_t jnorm_factor = 0.0;
 sample_anl_state janls;
-gridpt *gridpt_buf = NULL;
-size_t gridpt_buf_max = 0, gridpt_buf_len = 0;
-gridpt_seq *gridpt_seqdb = NULL;
-size_t gridpt_seqdb_max = 0, gridpt_seqdb_len = 0;
+gridpt *gpt_buf = NULL;
+size_t gpt_buf_max = 0, gpt_buf_len = 0;
+gpt_seq *gpt_seqdb = NULL;
+size_t gpt_seqdb_max = 0, gpt_seqdb_len = 0;
 
 void sample_anl_state_init (sample_anl_state *s) {
   memset (s, 0, sizeof (*s));
@@ -346,106 +346,106 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->x = x;
 }
 
-size_t gridpt_buf_dur (int i) {
-  return (gridpt_buf [gridpt_buf_len - 1].framecnt - gridpt_buf [i].framecnt);
+size_t gpt_buf_dur (int i) {
+  return (gpt_buf [gpt_buf_len - 1].framecnt - gpt_buf [i].framecnt);
 }
-static float gridpt_buf_add (sample_t x, jack_nframes_t count) {
-  ASSERT (gridpt_buf_len < gridpt_buf_max);
-  gridpt_buf [gridpt_buf_len].x = x;
-  gridpt_buf [gridpt_buf_len].framecnt = count;
-  ++gridpt_buf_len;
-  return ((float) gridpt_buf_dur (0)) / recog_frames;
+static float gpt_buf_add (sample_t x, jack_nframes_t count) {
+  ASSERT (gpt_buf_len < gpt_buf_max);
+  gpt_buf [gpt_buf_len].x = x;
+  gpt_buf [gpt_buf_len].framecnt = count;
+  ++gpt_buf_len;
+  return ((float) gpt_buf_dur (0)) / recog_frames;
 }
-static void gridpt_buf_shift () {
-  memmove (gridpt_buf, gridpt_buf + 1,
-           --gridpt_buf_len * sizeof (gridpt));
+static void gpt_buf_shift () {
+  memmove (gpt_buf, gpt_buf + 1,
+           --gpt_buf_len * sizeof (gridpt));
 }
-static void gridpt_seq_fix_lengths (gridpt *seq, size_t len) {
+static void gpt_seq_fix_lengths (gridpt *seq, size_t len) {
   size_t i = len;
   for (; i > 0; --i)
     seq [i - 1].framecnt -= seq [0].framecnt;
 }
-static void gridpt_seq_init (gridpt_seq *entry, gridpt *seq, size_t len) {
+static void gpt_seq_init (gpt_seq *entry, gridpt *seq, size_t len) {
   ASSERT (len >= 2);
   size_t bytes = len * sizeof (gridpt);
   entry->seq = malloc (bytes); ASSERT (entry->seq != NULL);
   memcpy (entry->seq, seq, bytes);
   entry->dur = seq [len - 1].framecnt - seq [0].framecnt;
-  gridpt_seq_fix_lengths (entry->seq, len);
+  gpt_seq_fix_lengths (entry->seq, len);
   entry->length = len;
-  entry->type = gridpt_seq_type (seq);
+  entry->type = gpt_seq_type (seq);
   entry->note = MIDI_NOTE_NONE;
 }
-static void gridpt_seq_add (midi_note_t note, gridpt *seq, size_t len) {
-  if (gridpt_seqdb_len == gridpt_seqdb_max) {
-    gridpt_seqdb_max = 1.5 * gridpt_seqdb_max;
-    gridpt_seqdb = realloc (gridpt_seqdb, gridpt_seqdb_max * sizeof (gridpt_seq));
-    ASSERT (gridpt_seqdb != NULL);
+static void gpt_seq_add (midi_note_t note, gridpt *seq, size_t len) {
+  if (gpt_seqdb_len == gpt_seqdb_max) {
+    gpt_seqdb_max = 1.5 * gpt_seqdb_max;
+    gpt_seqdb = realloc (gpt_seqdb, gpt_seqdb_max * sizeof (gpt_seq));
+    ASSERT (gpt_seqdb != NULL);
   }
-  gridpt_seq *entry = &gridpt_seqdb [gridpt_seqdb_len];
-  gridpt_seq_init (entry, seq, len);
+  gpt_seq *entry = &gpt_seqdb [gpt_seqdb_len];
+  gpt_seq_init (entry, seq, len);
   entry->note = note;
 
-  ++gridpt_seqdb_len;
+  ++gpt_seqdb_len;
 }
-static void gridpt_seq_add_all (midi_note_t note, jack_nframes_t minframes) {
-  for (size_t i = 0; i < gridpt_buf_len && gridpt_buf_dur (i) >= minframes; ++i)
-    gridpt_seq_add (note, &gridpt_buf [i], gridpt_buf_len - i);
+static void gpt_seq_add_all (midi_note_t note, jack_nframes_t minframes) {
+  for (size_t i = 0; i < gpt_buf_len && gpt_buf_dur (i) >= minframes; ++i)
+    gpt_seq_add (note, &gpt_buf [i], gpt_buf_len - i);
 }
 
 typedef struct {
   midi_note_t note;
   float dist;
-} gpb_anl_state;
-void gpb_anl_state_init (gpb_anl_state *s) {
+} gpt_seq_anl_state;
+void gpt_seq_anl_state_init (gpt_seq_anl_state *s) {
   s->note = MIDI_NOTE_NONE;
   s->dist = INFINITY;
 }
-static int gridpt_seq_search (const gridpt_seq *gseq,
+static int gpt_seq_search (const gpt_seq *gseq,
                               size_t beg, size_t end, size_t *mid)
 {
   int rc = INT_MAX;
   assert (beg < end);
   while (beg < end) {
     *mid = (((unsigned) beg) + (unsigned) (end - 1)) >> 1;
-    rc = gridpt_seq_cmp (gseq, &gridpt_seqdb [*mid]);
+    rc = gpt_seq_cmp (gseq, &gpt_seqdb [*mid]);
     if (rc > 0) beg = *mid + 1;
     else if (rc < 0) end = *mid;
     else break;
   }
   return rc;
 }
-static midi_note_t gridpt_seq_analyze (gpb_anl_state *state) {
-  ASSERT (gridpt_buf_len >= 2);
+static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
+  ASSERT (gpt_buf_len >= 2);
 
   midi_note_t note = MIDI_NOTE_NONE, minnote = MIDI_NOTE_NONE;;
-  gridpt_seq gseq; gridpt_seq_init (&gseq, gridpt_buf, gridpt_buf_len);
+  gpt_seq gseq; gpt_seq_init (&gseq, gpt_buf, gpt_buf_len);
   gridpt *seq = gseq.seq;
   float mindist = INFINITY, mindist_cnote = INFINITY;
   size_t minidx = 0, minidx_cnote = 0;
 
-  gridpt_seq gseq_lo = gseq; gseq_lo.dur *= INV_SEMITONE_RATIO;
-  gridpt_seq gseq_hi = gseq; gseq_hi.dur *= SEMITONE_RATIO;
-  if (gridpt_seq_cmp (&gseq_hi, &gridpt_seqdb [gridpt_seqdb_len - 1]) > 0)
-    gseq_hi = gridpt_seqdb [gridpt_seqdb_len - 1];
-  size_t lo = 0, hi = gridpt_seqdb_len - 1, i = 0;
-  int rc = gridpt_seq_search (&gseq_lo, lo, hi + 1, &lo);
+  gpt_seq gseq_lo = gseq; gseq_lo.dur *= INV_SEMITONE_RATIO;
+  gpt_seq gseq_hi = gseq; gseq_hi.dur *= SEMITONE_RATIO;
+  if (gpt_seq_cmp (&gseq_hi, &gpt_seqdb [gpt_seqdb_len - 1]) > 0)
+    gseq_hi = gpt_seqdb [gpt_seqdb_len - 1];
+  size_t lo = 0, hi = gpt_seqdb_len - 1, i = 0;
+  int rc = gpt_seq_search (&gseq_lo, lo, hi + 1, &lo);
   if (rc != 0) {
-    int rc1 = gridpt_seq_cmp1 (&gridpt_seqdb [lo], &gseq_lo);
+    int rc1 = gpt_seq_cmp1 (&gpt_seqdb [lo], &gseq_lo);
     if (rc1 < 0) {
-      if (gridpt_seq_cmp1 (&gridpt_seqdb [++lo], &gseq_lo) != 0) goto ret;
+      if (gpt_seq_cmp1 (&gpt_seqdb [++lo], &gseq_lo) != 0) goto ret;
     }
     else if (rc1 > 0) goto ret;
   }
 
-  for (i = lo; gridpt_seq_cmp (&gridpt_seqdb [i], &gseq_hi) <= 0; ++i) {
-    midi_note_t newnote = gridpt_seqdb [i].note;
+  for (i = lo; gpt_seq_cmp (&gpt_seqdb [i], &gseq_hi) <= 0; ++i) {
+    midi_note_t newnote = gpt_seqdb [i].note;
     if (! note_scale [newnote % 12]) continue;
-    gridpt *seq2 = gridpt_seqdb [i].seq;
-    float dscale = (double) SQR (gridpt_seqdb [i].dur) / (gridpt_buf_len - 1);
+    gridpt *seq2 = gpt_seqdb [i].seq;
+    float dscale = (double) SQR (gpt_seqdb [i].dur) / (gpt_buf_len - 1);
     sample_t dist = 0.0;
     size_t j = 0;
-    for (; j < gridpt_buf_len; j++) {
+    for (; j < gpt_buf_len; j++) {
       sample_t x = seq [j].x;
       if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
       jack_nframes_t l = seq [j].framecnt, l2 = seq2 [j].framecnt;
@@ -464,7 +464,7 @@ static midi_note_t gridpt_seq_analyze (gpb_anl_state *state) {
   next_seq:
     if (dist > 0.0)
       TRACE (TRACE_INT + 2, "tried note %d j=%d/%d d=%lf",
-             (int) gridpt_seqdb [i].note, j, gridpt_buf_len, dist);
+             (int) gpt_seqdb [i].note, j, gpt_buf_len, dist);
   }
 
   if (isinf (mindist_cnote) && isfinite (state->dist))
@@ -472,7 +472,7 @@ static midi_note_t gridpt_seq_analyze (gpb_anl_state *state) {
   else if (isfinite (mindist_cnote) && mindist_cnote > state->dist)
     mindist_cnote = state->dist = 0.2 * state->dist + 0.8 * mindist_cnote;
   if (isfinite (mindist)) {
-    minnote = gridpt_seqdb [minidx].note;
+    minnote = gpt_seqdb [minidx].note;
     if (minnote == state->note ||
         (mindist < SQR (SEMITONE_RATIO - 1) && mindist * QTTONE_RATIO <= mindist_cnote))
     {
@@ -482,10 +482,10 @@ static midi_note_t gridpt_seq_analyze (gpb_anl_state *state) {
   state->dist = mindist_cnote;
 
   goto ret;
-  
+
 ret: (void) 0;
   gseq.note = note;
-  char buf [2048]; gridpt_seq_dump (&gseq, buf, sizeof (buf));
+  char buf [2048]; gpt_seq_dump (&gseq, buf, sizeof (buf));
   TRACE (TRACE_INT + 1, "min %d-%d: d=%f d_cn=%f i=%d i_cn=%d seq %s",
          lo, i, mindist, mindist_cnote, minidx, minidx_cnote, buf);
   free (seq); return note;
@@ -508,12 +508,12 @@ static void process_waveform_db () {
   wavebrk_sil_frames = srate / 100 * wavebrk_sil_ms / 10;
   recog_frames = srate / 100 * recog_ms / 10;
   train_max_frames = srate / 100 * train_max_ms / 10;
-  gridpt_buf_max = note_midi2freq (himidi) * recog_ms / 1000 * 64;
-  gridpt_buf = malloc (sizeof (gridpt) * gridpt_buf_max);
-  ASSERT (gridpt_buf != NULL);
-  gridpt_seqdb_max = 20000;
-  gridpt_seqdb = malloc (gridpt_seqdb_max * sizeof (gridpt_seq));
-  ASSERT (gridpt_seqdb != NULL);
+  gpt_buf_max = note_midi2freq (himidi) * recog_ms / 1000 * 64;
+  gpt_buf = malloc (sizeof (gridpt) * gpt_buf_max);
+  ASSERT (gpt_buf != NULL);
+  gpt_seqdb_max = 20000;
+  gpt_seqdb = malloc (gpt_seqdb_max * sizeof (gpt_seq));
+  ASSERT (gpt_seqdb != NULL);
 
   double x;
   sample_anl_state anls; sample_anl_state_init (&anls);
@@ -529,7 +529,7 @@ static void process_waveform_db () {
 
   for (midi_note_t note = lomidi; note <= himidi; ++note) {
     double note_period = 1 / note_midi2freq (note);
-    
+
     TRACE (TRACE_INT, "Reading MIDI note %d waveform, frame=%ld",
                (int) note, (long) my_sf_tell (dbf));
     // skip silence
@@ -543,7 +543,7 @@ static void process_waveform_db () {
     sf_count_t note_pos = my_sf_tell (dbf);
     anls.count = 1;
     sample_anl_state stdanls = anls;
-    gridpt_buf_len = 0;
+    gpt_buf_len = 0;
     do {
       if ((anls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0 &&
           anls.count < train_max_frames)
@@ -552,14 +552,14 @@ static void process_waveform_db () {
 #define TEST( part, cond ) case part: if (! (cond)) continue; break
           switch (part) {
             TEST (0, (anls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
-                  gridpt_buf_add (anls.old_peak, anls.peak_at) > INV_SEMITONE_RATIO);
+                  gpt_buf_add (anls.old_peak, anls.peak_at) > INV_SEMITONE_RATIO);
             TEST (1, (anls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
-                  gridpt_buf_add (0, anls.count) > INV_SEMITONE_RATIO);
+                  gpt_buf_add (0, anls.count) > INV_SEMITONE_RATIO);
           }
 #undef TEST
-          while (gridpt_buf_dur (0) > (recog_frames + note_period * srate / 4) * SEMITONE_RATIO)
-            gridpt_buf_shift ();
-          gridpt_seq_add_all (note, INV_SEMITONE_RATIO * recog_frames);
+          while (gpt_buf_dur (0) > (recog_frames + note_period * srate / 4) * SEMITONE_RATIO)
+            gpt_buf_shift ();
+          gpt_seq_add_all (note, INV_SEMITONE_RATIO * recog_frames);
         }
       }
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
@@ -567,7 +567,7 @@ static void process_waveform_db () {
     } while ((anls.evt & (1 << ANL_EVT_SIL)) == 0);
 
     TRACE (TRACE_INT, "MIDI note %d Waveform ends at frame=%ld, seqs=%d",
-           (int) note, (long) my_sf_tell (dbf), gridpt_seqdb_len);
+           (int) note, (long) my_sf_tell (dbf), gpt_seqdb_len);
     if (note == stdmidi) {
       sf_count_t saved_pos = my_sf_tell (dbf);
       sf_seek (dbf, note_pos, SEEK_SET);
@@ -591,15 +591,15 @@ static void process_waveform_db () {
     }
   }
 
-  qsort (gridpt_seqdb, gridpt_seqdb_len, sizeof (gridpt_seqdb [0]),
-         (int (*) (const void *, const void *)) gridpt_seq_cmp);
-  
-  for (size_t i = 0; i < gridpt_seqdb_len; i++) {
-    char buf [2048]; gridpt_seq_dump (&gridpt_seqdb [i], buf, sizeof (buf));
+  qsort (gpt_seqdb, gpt_seqdb_len, sizeof (gpt_seqdb [0]),
+         (int (*) (const void *, const void *)) gpt_seq_cmp);
+
+  for (size_t i = 0; i < gpt_seqdb_len; i++) {
+    char buf [2048]; gpt_seq_dump (&gpt_seqdb [i], buf, sizeof (buf));
     TRACE (TRACE_INT, "seq i=%d %s", i, buf);
     if (i % 10 == 0) trace_flush ();
   }
-  TRACE (TRACE_INFO, "%d sequences loaded from waveform db", gridpt_seqdb_len);
+  TRACE (TRACE_INFO, "%d sequences loaded from waveform db", gpt_seqdb_len);
   return;
 
 premature:
@@ -666,13 +666,13 @@ static void *process_thread (void *arg) {
 
     jack_midi_data_t evt [24];
     size_t evtcnt = 0;
-    for (; evtcnt < sizeof (evt) / sizeof (evt [0]) / 3 
+    for (; evtcnt < sizeof (evt) / sizeof (evt [0]) / 3
            && 0 == sem_trywait (&jmidibuf_sem);
          ++evtcnt)
     {
       char ch;
       jack_ringbuffer_read (jmidibuf, &ch, 1);
-      pack_midi_evt (&evt [evtcnt * 3], 
+      pack_midi_evt (&evt [evtcnt * 3],
                      ch & ((1 << 7) - 1), velo0, (ch & (1 << 7)) != 0);
     }
     void *out = jack_port_get_buffer (jmidiport, nframes);
@@ -682,7 +682,7 @@ static void *process_thread (void *arg) {
         jack_midi_event_write (out, 0, evt + 3 * i, sizeof (evt [0]) * 3);
     }
 
-    sample_t *in = jack_port_get_buffer (jport, nframes);    
+    sample_t *in = jack_port_get_buffer (jport, nframes);
     if (-1 == (rc = semctl (jbufavail_semid, 0, GETVAL))) {
       TRACE_PERROR (TRACE_FATAL, "semctl");
       break;
@@ -758,18 +758,18 @@ void send_note (midi_note_t note, int on) {
 
 static void midi_server () {
   midi_note_t cnote = 0;
-  gpb_anl_state gpbs;
-  gpb_anl_state_init (&gpbs);
+  gpt_seq_anl_state gpbs;
+  gpt_seq_anl_state_init (&gpbs);
   TRACE (TRACE_IMPT, "MIDI server started, delay %lf", recog_ms);
-  gridpt_buf_len = 0;
+  gpt_buf_len = 0;
   for (;;) {
     analyze_sample (get_jsample () * jnorm_factor, &janls);
     if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != 0) {
       send_note (cnote, 0); sem_post (&jmidibuf_sem);
       cnote = 0;
-      gpb_anl_state_init (&gpbs);
+      gpt_seq_anl_state_init (&gpbs);
       TRACE (TRACE_INFO, "Note off");
-      gridpt_buf_len = 0;
+      gpt_buf_len = 0;
     }
     if ((janls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0)
     {
@@ -777,23 +777,23 @@ static void midi_server () {
 #define TEST( part, cond ) case part: if (! (cond)) continue; break
         switch (part) {
           TEST (0, (janls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
-                gridpt_buf_add (janls.old_peak, janls.peak_at) > 1);
+                gpt_buf_add (janls.old_peak, janls.peak_at) > 1);
           TEST (1, (janls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
-                gridpt_buf_add (0, janls.count) > 1);
+                gpt_buf_add (0, janls.count) > 1);
         }
 #undef TEST
         // when a point is added AND completes a sequence
-        while (gridpt_buf_dur (1) > recog_frames)
-          gridpt_buf_shift ();
-        midi_note_t note = gridpt_seq_analyze (&gpbs);
+        while (gpt_buf_dur (1) > recog_frames)
+          gpt_buf_shift ();
+        midi_note_t note = gpt_seq_analyze (&gpbs);
         if (note != MIDI_NOTE_NONE && note != cnote) {
           int cut_last = cnote != 0;
           send_note (note, 1);
           if (cut_last)
             send_note (cnote, 0);
-          sem_post (&jmidibuf_sem); if (cut_last) sem_post (&jmidibuf_sem); 
+          sem_post (&jmidibuf_sem); if (cut_last) sem_post (&jmidibuf_sem);
 
-          cnote = note;          
+          cnote = note;
           char scinote [4]; note_midi2sci (note, scinote);
           TRACE (TRACE_INFO, "Note %s", scinote);
         }
@@ -848,7 +848,7 @@ static void setup_audio () {
 
   if (NULL == (jport = jack_port_register (jclient, "in", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0)))
     goto jack_setup_fail;
-  
+
   if (NULL == (jmidiport = jack_port_register (jclient, "midiout", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0)))
     goto jack_setup_fail;
   if (0 != jack_activate (jclient))
@@ -888,7 +888,7 @@ NL "  --scale S          Scale restriction (e.g. C#min, EbMaj)"
 NL "  --log-level N      Log level (higher = more details, defaults to 4)"
           );
 #undef NL
-  
+
   trace_level = TRACE_NONE;
   exit (fmt == NULL ? EXIT_SUCCESS : EXIT_FAILURE);
 }
@@ -1057,7 +1057,7 @@ int main (int argc, char **argv) {
 }
 
 /*
-  
+
   XSI semaphores + threads aren't portable, and POSIX semaphores only increment
   by 1.
 
@@ -1074,9 +1074,14 @@ int main (int argc, char **argv) {
 
 */
 
+// Local Variables:
+// write-file-functions: (lambda () (delete-trailing-whitespace) nil)
+// compile-command: "cc -Os -g -std=c99 -pthread -Wall -Wextra -march=native -pipe -ljack -lsndfile -lm synthinvert.c -o synthinvert"
+// End:
+
 /*
   Compile with:
-  
+
   cc -Os -g -std=c99 -D_REENTRANT -Wall -Wextra $CFLAGS -ljack -lsndfile -lm synthinvert.c -o synthinvert
   # -fmudflapth -lmudflapth
 */
