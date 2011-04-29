@@ -40,7 +40,7 @@ typedef union {
   int val; struct semid_ds *buf; unsigned short  *array;
 } semctl_arg_t;
 const char *name = "synthinvert";
-const char *srcport = NULL;
+const char *srcport = NULL, *dstport = NULL;
 const char *dbfname = NULL;
 midi_note_t lomidi = 0, himidi = 0;  /* range of our synth */
 midi_note_t stdmidi = 60;  /* note to calibrate against */
@@ -858,10 +858,14 @@ static void setup_audio () {
   if (0 != jack_activate (jclient))
     goto jack_setup_fail;
 
+  if (NULL != dstport && 0 != jack_connect (jclient, jack_port_name (jmidiport), dstport))
+    goto jack_setup_fail;
+
   if (0 != jack_connect (jclient, srcport, jack_port_name (jport)))
     goto jack_setup_fail;
   sem_post (&jcon_sem);
-  TRACE (TRACE_DIAG, "Activated");
+
+  TRACE (TRACE_DIAG, "Activated and connected");
 
   return;
 
@@ -884,9 +888,10 @@ void usage (const char *fmt, ...) {
 NL "  or:  " MYNAME " { -h | --help | -? | --version }"
 NL
 NL "Options:"
-NL "  -p, --port JP      Jack audio port to listen on (e.g. system:capture_1)"
 NL "  -f, --db FILE      Training recording from synth"
 NL "  -r, --range RANGE  Range of notes in training file (e.g. F2-C5)"
+NL "  -p, --port JP      Jack audio port to listen on (e.g. system:capture_1)"
+NL "  -t, --midi-to JP   Jack MIDI port to output to"
 NL "  --transpose SEMIT  Semitones to transpose (e.g. -12)"
 NL "  --scale S          Scale restriction (e.g. C#min, EbMaj)"
 NL "  --log-level N      Log level (higher = more details, defaults to 4)"
@@ -920,6 +925,8 @@ static void parse_args (char **argv) {
         ++argv;
       } else if (0 == strcmp (*argv, "-p") || 0 == strcmp (*argv, "--port")) {
         srcport = *++argv;
+      } else if (0 == strcmp (*argv, "-t") || 0 == strcmp (*argv, "--midi-to")) {
+        dstport = *++argv;
       } else if (0 == strcmp (*argv, "-d") || 0 == strcmp (*argv, "--delay")) {
         if (sscanf (*++argv, "%lf", &recog_ms) != 1)
           usage ("Bad delay %s", *argv);
