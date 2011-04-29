@@ -296,7 +296,7 @@ jack_ringbuffer_t *jbuf = NULL, *jmidibuf = NULL;
 sample_t *jdataptr = NULL, *jdataend = NULL;
 jack_nframes_t jdatalen = 0;
 int jbufavail_semid; int jbufavail_valid = 0;
-sem_t jcon_sem, jmidibuf_sem;
+sem_t jmidibuf_sem;
 sample_t norm_noise_peak = 0;
 sample_anl_state stdmidi_anls;
 sample_t jnorm_factor = 0.0;
@@ -651,19 +651,15 @@ void pack_midi_evt (jack_midi_data_t *buf, midi_note_t note, int velo, int on) {
 static void *process_thread (void *arg) {
   (void) arg;
 
-  int connected = 0;
   int rc;
   jack_nframes_t lost_frames = 0;
 
   for (;;) {
 
-    if (! connected && 0 == sem_trywait (&jcon_sem))
-      connected = 1;
-
     jack_nframes_t nframes_orig = jack_cycle_wait (jclient),
       nframes = nframes_orig;
     if (zombified) break;
-    if (! connected) {
+    if (0 == jack_port_connected (jport)) {
       jack_cycle_signal (jclient, 0);
       continue;
     }
@@ -704,7 +700,7 @@ static void *process_thread (void *arg) {
     lost_frames += nframes_orig - nframes;
     if (lost_frames > 0) {
       if (0 == pthread_mutex_trylock (&trace_buf->lock)) {
-        TRACE (TRACE_WARN, "Lost frames %d", (int) lost_frames);
+        //TRACE (TRACE_WARN, "Lost frames %d", (int) lost_frames);
         lost_frames = 0;
         pthread_mutex_unlock (&trace_buf->lock);
       }
@@ -827,8 +823,6 @@ static void setup_audio () {
     TRACE_PERROR (TRACE_FATAL, "semctl");
     myshutdown (1);
   }
-  sem_init (&jmidibuf_sem, 0, 0);
-  sem_init (&jcon_sem, 0, 0);
   jack_options_t jopt = 0;  // JackNoStartServer;
   jack_status_t jstat;
   if (NULL == (jclient = jack_client_open (name, jopt, &jstat)))
@@ -852,20 +846,19 @@ static void setup_audio () {
 
   if (NULL == (jport = jack_port_register (jclient, "in", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0)))
     goto jack_setup_fail;
-
-  if (NULL == (jmidiport = jack_port_register (jclient, "midiout", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0)))
+  if (NULL == (jmidiport = jack_port_register (jclient, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0)))
     goto jack_setup_fail;
+
   if (0 != jack_activate (jclient))
     goto jack_setup_fail;
 
   if (NULL != dstport && 0 != jack_connect (jclient, jack_port_name (jmidiport), dstport))
     goto jack_setup_fail;
 
-  if (0 != jack_connect (jclient, srcport, jack_port_name (jport)))
+  if (NULL != srcport && 0 != jack_connect (jclient, srcport, jack_port_name (jport)))
     goto jack_setup_fail;
-  sem_post (&jcon_sem);
 
-  TRACE (TRACE_DIAG, "Activated and connected");
+  TRACE (TRACE_DIAG, "Activated");
 
   return;
 
@@ -969,10 +962,6 @@ static void parse_args (char **argv) {
     TRACE (TRACE_FATAL, "calibration MIDI note %d out of range", (int) stdmidi);
     myshutdown (1);
   }
-  if (NULL == srcport) {
-    TRACE (TRACE_FATAL, "no source port (--port) specified");
-    myshutdown (1);
-  }
 }
 
 static void *poll_thread (void *arg) {
@@ -1029,7 +1018,7 @@ static void sig_handler (int sig) {
 }
 
 void setup_sigs () {
-  int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT };
+  int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT, SIGALRM };
   sigemptyset (&sigmask);
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
     sigaddset (&sigmask, sigarr [i]);
