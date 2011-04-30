@@ -47,7 +47,9 @@ midi_note_t transpose_semitones = 0;
 midi_note_t lomidi = 0, himidi = 0;  ///< MIDI note range of our synth
 midi_note_t stdmidi = 60;  ///< MIDI note to calibrate against
 int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
-int velo0 = 100;  ///< MIDI velocity of notes
+int velo_on = 100,  ///< MIDI velocity of note-on
+  velo_off = 0;     ///< MIDI velocity of note-off
+int midi_chan = 0;  ///< MIDI channel to send notes on
 int initial_sil_ms = 450;     ///< duration of segment for noise estimation
 double wavebrk_sil_ms = 1.5;  ///< msecs triggering silence detection
 double recog_ms = 12;         ///< min duration of waveform to be recognized
@@ -73,9 +75,9 @@ static void mutex_cleanup_routine (void *lock_) {
   pthread_mutex_lock (lock);                            \
   pthread_cleanup_push (mutex_cleanup_routine, (lock))
 
-static void pack_midi_evt (jack_midi_data_t *buf, midi_note_t note, int velo, int on) {
-  buf [0] = on ? 0x90 : 0x80;
-  buf [1] = note; buf [2] = on ? velo : 0;
+static void pack_midi_evt (jack_midi_data_t *buf, midi_note_t note, int on) {
+  buf [0] = (on ? 0x90 : 0x80) | midi_chan;
+  buf [1] = note; buf [2] = on ? velo_on : velo_off;
 }
 
 static const midi_note_t note_semitones [] = { 0, 2, 4, 5, 7, 9, 11, 12 };
@@ -727,7 +729,7 @@ static void *process_thread (void *arg) {
       char ch;
       jack_ringbuffer_read (jmidibuf, &ch, 1);
       pack_midi_evt (&evt [evtcnt * 3],
-                     ch & ((1 << 7) - 1), velo0, (ch & (1 << 7)) != 0);
+                     ch & ((1 << 7) - 1), (ch & (1 << 7)) != 0);
     }
     void *out = jack_port_get_buffer (jmidiport, nframes);
     jack_midi_clear_buffer (out);
@@ -946,10 +948,13 @@ NL "  -f, --db FILE      Notes recorded from synth for training"
 NL "  -r, --range RANGE  Range of notes in training file (e.g. F2-C5)"
 NL "  -p, --port JP      Jack audio port to listen on (e.g. system:capture_1)"
 NL "  -t, --midi-to JP   Jack MIDI port to output to"
+NL "  --train-max MSEC   Truncate recorded notes to MSEC during training"
+NL "  --log-level N      Log level (defaults to 4, increase for details)"
+NL "  --velo V           MIDI note-on velocity (default 100)"
+NL "  --velo-off Voff    MIDI note-off velocity (default 0)"
+NL "  -c, --chan C       MIDI channel number"
 NL "  --transpose SEMIT  Semitones to transpose (e.g. -12)"
 NL "  --scale S          Scale restriction (e.g. C#min, EbMaj)"
-NL "  --log-level N      Log level (defaults to 4, increase for details)"
-NL "  --train-max MSEC   Truncate recorded notes to MSEC during training"
 NL ""
 NL MYNAME " needs a mono recording containing all the notes of the chromatic"
 NL "scale in the given --range, with short pauses in between. After loading this"
@@ -995,6 +1000,13 @@ static void parse_args (char **argv) {
           usage ("Bad delay %s", *argv);
       } else if (0 == strcmp (*argv, "--train-max")) {
         sscanf (*++argv, "%lf", &train_max_ms);
+      } else if (0 == strcmp (*argv, "-c") || 0 == strcmp (*argv, "--chan")) {
+        sscanf (*++argv, "%d", &midi_chan);
+        assert (midi_chan >= 0 && midi_chan < 128);
+      } else if (0 == strcmp (*argv, "--velo")) {
+        sscanf (*++argv, "%d", &velo_on);
+      } else if (0 == strcmp (*argv, "--velo-off")) {
+        sscanf (*++argv, "%d", &velo_off);
       } else if (0 == strcmp (*argv, "--transpose")) {
         int sems;
         if (sscanf (*++argv, "%d", &sems) != 1)
