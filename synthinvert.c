@@ -29,8 +29,8 @@
 
 
 // type aliases & constants
-#define MYNAME "synthinvert"
-typedef int midi_note_t;  /* 0-127, 21=A0, 60=C4 */
+#define MYNAME "sintvert"
+typedef int midi_note_t;  ///< A MIDI note (0-127, 21=A0, 60=C4)
 #define MIDI_NOTE_NONE ((midi_note_t) -1)
 double SEMITONE_RATIO = 1.06, INV_SEMITONE_RATIO = 0.94,
   QTTONE_RATIO = 1.03, QTTONE_RATIO_INV = 0.97;
@@ -40,31 +40,35 @@ typedef union {  // POSIX requires *us* to declare it instead of <sys/sem.h>
 } semctl_arg_t;
 
 // configurable params
-const char *srcport = NULL, *dstport = NULL;
-const char *dbfname = NULL;
-midi_note_t lomidi = 0, himidi = 0;  ///< range of our synth
-midi_note_t stdmidi = 60;  ///< note to calibrate against
-midi_note_t transpose_semitones = 0;
+/// Allowed notes
 int note_scale [12] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+/// Semitones to shift all output MIDI notes.
+midi_note_t transpose_semitones = 0;
+midi_note_t lomidi = 0, himidi = 0;  ///< MIDI note range of our synth
+midi_note_t stdmidi = 60;  ///< MIDI note to calibrate against
 int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
-int velo0 = 100;
-int initial_sil_ms = 450;
-double wavebrk_sil_ms = 1.5; ///< msecs of silence triggering detection
-double recog_ms = 12;
-double train_max_ms = 250;  ///< how much to analyze from a waveform
-
+int velo0 = 100;  ///< MIDI velocity of notes
+int initial_sil_ms = 450;     ///< duration of segment for noise estimation
+double wavebrk_sil_ms = 1.5;  ///< msecs triggering silence detection
+double recog_ms = 12;         ///< min duration of waveform to be recognized
+double train_max_ms = 250;    ///< how much to analyze from training waveforms
+/// File containing synth note sequence recording
+const char *dbfname = NULL;
+const char *srcport = NULL, *dstport = NULL;
 
 // --- UTILS ---
 
 #define SQR( x ) ((x) * (x))
 
-// sndfile doesn't have it
+// Since sndfile doesn't have it...
 static sf_count_t my_sf_tell (SNDFILE *sndfile)
 { return sf_seek (sndfile, 0, SEEK_CUR); }
 
 static void mutex_cleanup_routine (void *lock_) {
   pthread_mutex_unlock ((pthread_mutex_t *) lock_);
 }
+/// Locks a mutex and pushes a @c pthread_cleanup routine.
+/// Must be matched with a <code>pthread_cleanup_pop (1)</code>
 #define MUTEX_LOCK_WITH_CLEANUP( lock )                 \
   pthread_mutex_lock (lock);                            \
   pthread_cleanup_push (mutex_cleanup_routine, (lock))
@@ -259,32 +263,49 @@ void print_backtrace () {
 #endif
 
 typedef struct {
-  int npeaks, max_peak_idx;
-  sample_t x, peak, old_peak, max_x, max_peak, noise_peak;
-  jack_nframes_t count, voiced_ago, peak_at;
-  int evt;
+  int npeaks,  ///< Total number of peaks
+    max_peak_idx;  ///< Index of @c max_peak (among all peaks)
+  sample_t x,  ///< Latest sample analyzed
+    peak,  ///< Current peak candidate
+    old_peak,  ///< Latest confirmed peak
+    max_x,  ///< Largest absolute value ever
+    max_peak,  ///< Largest peak
+    noise_peak;  ///< Estimated noise level
+  jack_nframes_t count,  ///< Frame counter
+    voiced_ago,  ///< Frames since last sample above @c noise_peak
+    peak_at;  ///< Frame count of @c old_peak
+  int evt;  ///< Event flags OR-ed together, see @c sample_anl_event_bit
 } sample_anl_state;
-enum { ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL };
+typedef enum {
+  ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL
+} sample_anl_event_bit;
 void sample_anl_state_init (sample_anl_state *s) {
   memset (s, 0, sizeof (*s));
   s->voiced_ago = JACK_MAX_FRAMES;
 }
 
+/// A feature point in the waveform (peak or zero crossing)
 typedef struct {
-  sample_t x;
-  jack_nframes_t framecnt;
+  sample_t x;  ///< Amplitude
+  jack_nframes_t framecnt;  ///< Frame count
 } gridpt;
+/// Sequence type from @c gpt_seq_type
+typedef enum {
+  GPT_SEQ_POSITIVE, GPT_SEQ_NEGATIVE, GPT_SEQ_FALLING0, GPT_SEQ_RISING0
+} gpt_seq_type_t;
 typedef struct {
   gridpt *seq;
-  size_t length, dur;
+  size_t length;  ///< Number of points
+  jack_nframes_t dur;  ///< Frame duration of this sequence
   int type;
   midi_note_t note;
 } gpt_seq;
-int gpt_seq_type (gridpt *seq) {
-  if (seq [0].x > 0) return 0;
-  else if (seq [0].x < 0) return 1;
-  else if (seq [1].x < 0) return 2;
-  else return 3;
+/// Determines sequence type based on initial 2 points
+gpt_seq_type_t gpt_seq_type (gridpt *seq) {
+  if (seq [0].x > 0) return GPT_SEQ_POSITIVE;
+  else if (seq [0].x < 0) return GPT_SEQ_NEGATIVE;
+  else if (seq [1].x < 0) return GPT_SEQ_FALLING0;
+  else return GPT_SEQ_RISING0;
 }
 static char *gpt_seq_dump (const gpt_seq *gseq, char *buf, size_t sz) {
   static char buf_ [256]; if (buf == NULL) { buf = buf_; sz = sizeof (buf_); }
@@ -295,6 +316,7 @@ static char *gpt_seq_dump (const gpt_seq *gseq, char *buf, size_t sz) {
     memfile_printf (&mf, " (%f %d)", gseq->seq [i].x, gseq->seq [i].framecnt);
   return buf;
 }
+/// Rough comparison function based on @c gpt_seq's @c length and @c type
 int gpt_seq_cmp1 (const gpt_seq *s1, const gpt_seq *s2) {
   if      (s1->length < s2->length) return -1;
   else if (s1->length > s2->length) return 1;
@@ -302,6 +324,7 @@ int gpt_seq_cmp1 (const gpt_seq *s1, const gpt_seq *s2) {
   else if (s1->type > s2->type) return 1;
   else return 0;
 }
+/// Refined comparison of @c gpt_seq's including duration
 int gpt_seq_cmp (const gpt_seq *s1, const gpt_seq *s2) {
   int rc1 = gpt_seq_cmp1 (s1, s2);
   if      (rc1 != 0) return rc1;
@@ -328,25 +351,28 @@ jack_nframes_t initial_sil_frames = 0,
   wavebrk_sil_frames = 0,
   recog_frames = 0,
   train_max_frames = 0;
-long srate = 0;
+long srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
 volatile int zombified = 0;
-jack_nframes_t jmaxbufsz = 0;
 jack_port_t *jport = NULL, *jmidiport = NULL;
-jack_nframes_t jbuf_len = 16384;  // limited by jbufavail semaphore max
-jack_ringbuffer_t *jbuf = NULL, *jmidibuf = NULL;
-sample_t *jdataptr = NULL, *jdataend = NULL;
-jack_nframes_t jdatalen = 0;
-int jbufavail_semid; int jbufavail_valid = 0;
-sem_t jmidibuf_sem;
-sample_t norm_noise_peak = 0;
-sample_anl_state stdmidi_anls;  // state for calibration note analyzer
-sample_t jnorm_factor = 0.0;  // multiplier against waveform db amplitude
-sample_anl_state janls;  // analyzer state for jack samples
-gridpt *gpt_buf = NULL;
-size_t gpt_buf_max = 0, gpt_buf_len = 0;
-gpt_seq *gpt_seqdb = NULL;
-size_t gpt_seqdb_max = 20000 /* grows */, gpt_seqdb_len = 0;
+jack_ringbuffer_t *jbuf = NULL,  ///< Incoming audio buffer
+  *jmidibuf = NULL;  ///< Outgoing MIDI buffer
+/// Size of @c jbuf.
+/// Limited by jbufavail semaphore max.
+jack_nframes_t jbuf_len = 16384;
+int jbufavail_semid;  ///< Counting semaphore for @c jbuf
+int jbufavail_valid = 0;  ///< Is @c jbufavail_semid active?
+sem_t jmidibuf_sem;  ///< Counting semaphore for @c jmidibuf
+sample_t norm_noise_peak = 0;  ///< Estimated noise amplitude in training file
+sample_anl_state stdmidi_anls;  ///< State for calibration note analyzer
+sample_t jnorm_factor = 0.0;  ///< Multiplier against training file loudness
+sample_anl_state janls;  ///< Analyzer state for jack samples
+gridpt *gpt_buf = NULL;  ///< Buffer of current feature points
+size_t gpt_buf_max = 0,  ///< Maximum for @c gpt_buf_len
+  gpt_buf_len = 0;  ///< Current size of @c gpt_buf
+gpt_seq *gpt_seqdb = NULL;  ///< Database of gpt sequences from training
+size_t gpt_seqdb_max = 20000 /* grows */,
+  gpt_seqdb_len = 0;  ///< Current size of @c gpt_seqdb
 
 void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->evt = 0;
@@ -380,7 +406,7 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->x = x;
 }
 
-static size_t gpt_buf_dur (int i) {
+static jack_nframes_t gpt_buf_dur (int i) {
   return (gpt_buf [gpt_buf_len - 1].framecnt - gpt_buf [i].framecnt);
 }
 static float gpt_buf_add (sample_t x, jack_nframes_t count) {
@@ -436,7 +462,7 @@ static void gpt_seq_anl_state_init (gpt_seq_anl_state *s) {
   s->dist = INFINITY;
 }
 static int gpt_seq_search (const gpt_seq *gseq,
-                              size_t beg, size_t end, size_t *mid)
+                           size_t beg, size_t end, size_t *mid)
 {
   int rc = INT_MAX;
   assert (beg < end);
@@ -553,7 +579,7 @@ static void load_waveform_db () {
   double x;
   sample_anl_state anls; sample_anl_state_init (&anls);
 
-  // find noise level in waveform db
+  // find noise level in training file
   for (sf_count_t i = 0; i < initial_sil_frames; ++i) {
     if (sf_read_double (dbf, &x, 1) < 1) goto premature;
     analyze_sample (x, &anls);
@@ -632,17 +658,20 @@ static void load_waveform_db () {
     TRACE (TRACE_INT, "seq i=%d %s", i, buf);
     if (i % 10 == 0) trace_flush ();
   }
-  TRACE (TRACE_INFO, "%d sequences loaded from waveform db", gpt_seqdb_len);
+  TRACE (TRACE_INFO, "%d sequences loaded from training file", gpt_seqdb_len);
 
   return;
 
 premature:
-  TRACE (TRACE_FATAL, "Premature end of waveform db file, frame=%ld",
+  TRACE (TRACE_FATAL, "Premature end of training file file, frame=%ld",
              (long) my_sf_tell (dbf));
   myshutdown (1);
 }
 
 static sample_t get_jsample () {
+  static jack_nframes_t jdatalen = 0;
+  static sample_t *jdataptr = NULL,  ///< Beginning of current data in @c jbuf
+    *jdataend = NULL;  ///< End of current data in @c jbuf
   int rc;
 
   if (jdataptr == jdataend) {
@@ -770,7 +799,7 @@ static void calibrate () {
     myshutdown (1);
   }
   jnorm_factor = stdmidi_anls.max_peak / janls.max_peak;
-  TRACE (TRACE_INFO, "Scaling factor against waveform db: %f", (float) jnorm_factor);
+  TRACE (TRACE_INFO, "Scaling factor against training file: %f", (float) jnorm_factor);
 
   // skip rest of note
   while (analyze_sample (get_jsample (), &janls),
@@ -860,12 +889,12 @@ static void setup_audio () {
   jack_on_shutdown (jclient, on_jack_shutdown, NULL);
   int jsrate = jack_get_sample_rate (jclient);
   if (jsrate != srate) {
-    TRACE (TRACE_FATAL, "Sample rate %d does not match waveform db's (%d)",
-               jsrate, srate);
+    TRACE (TRACE_FATAL, "Sample rate %d does not match training file's (%d)",
+           jsrate, srate);
     goto jack_setup_fail;
   }
 
-  jmaxbufsz = jack_get_buffer_size (jclient);
+  jack_nframes_t jmaxbufsz = jack_get_buffer_size (jclient);
   TRACE (TRACE_INFO, "Connected to jack, bufsize=%d, srate=%d",
              (int) jmaxbufsz, (int) srate);
   jbuf = jack_ringbuffer_create (jbuf_len * sizeof (sample_t)); ASSERT (jbuf != NULL);
@@ -907,18 +936,29 @@ static void usage (const char *fmt, ...) {
     printf ("\n\n");
   }
   printf ("%s\n",
-   "Usage: " MYNAME " -r RANGE -f FILE -p JACKPORT -d DELAY [OPTIONS]"
+   MYNAME " is a Jack wave-to-MIDI server for known waveforms"
+NL ""
+NL "Usage: " MYNAME " -r RANGE -f FILE -d DELAY [OPTIONS]"
 NL "  or:  " MYNAME " { -h | --help | -? | --version }"
 NL
 NL "Options:"
-NL "  -f, --db FILE      Training recording from synth"
+NL "  -f, --db FILE      Notes recorded from synth for training"
 NL "  -r, --range RANGE  Range of notes in training file (e.g. F2-C5)"
 NL "  -p, --port JP      Jack audio port to listen on (e.g. system:capture_1)"
 NL "  -t, --midi-to JP   Jack MIDI port to output to"
 NL "  --transpose SEMIT  Semitones to transpose (e.g. -12)"
 NL "  --scale S          Scale restriction (e.g. C#min, EbMaj)"
-NL "  --log-level N      Log level (higher = more details, defaults to 4)"
-          );
+NL "  --log-level N      Log level (defaults to 4, increase for details)"
+NL "  --train-max MSEC   Truncate recorded notes to MSEC during training"
+NL ""
+NL MYNAME " needs a mono recording containing all the notes of the chromatic"
+NL "scale in the given --range, with short pauses in between. After loading this"
+NL "training file, the program expects you to press the middle C key on your"
+NL "keyboard or synthesizer once for calibration (prior to this step you must"
+NL "connect " MYNAME " to Jack manually if -p was not given). The program"
+NL "estimates the loudness of the input signal compared to the training file, "
+NL "then starts recognizing notes and sending MIDI messages until killed."
+ );
 #undef NL
 
   trace_level = TRACE_NONE;
@@ -994,7 +1034,8 @@ static void parse_args (char **argv) {
   }
 }
 
-/// Performs periodic tasks. Stop it with pthread_cancel().
+/// Performs periodic tasks.
+/// Stop it with @c pthread_cancel().
 static void *poll_thread (void *arg) {
   (void) arg;
 
