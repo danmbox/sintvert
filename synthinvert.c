@@ -27,32 +27,116 @@
 #include <jack/ringbuffer.h>
 #include <sndfile.h>
 
+
+// type aliases & constants
 #define MYNAME "synthinvert"
-
-#define SQR( x ) ((x) * (x))
-
 typedef int midi_note_t;  /* 0-127, 21=A0, 60=C4 */
 #define MIDI_NOTE_NONE ((midi_note_t) -1)
 double SEMITONE_RATIO = 1.06, INV_SEMITONE_RATIO = 0.94,
   QTTONE_RATIO = 1.03, QTTONE_RATIO_INV = 0.97;
 typedef jack_default_audio_sample_t sample_t;
-typedef union {
-  int val; struct semid_ds *buf; unsigned short  *array;
+typedef union {  // POSIX requires *us* to declare it instead of <sys/sem.h>
+  int val; struct semid_ds *buf; unsigned short *array;
 } semctl_arg_t;
-const char *name = "synthinvert";
+
+// configurable params
 const char *srcport = NULL, *dstport = NULL;
 const char *dbfname = NULL;
-midi_note_t lomidi = 0, himidi = 0;  /* range of our synth */
-midi_note_t stdmidi = 60;  /* note to calibrate against */
+midi_note_t lomidi = 0, himidi = 0;  ///< range of our synth
+midi_note_t stdmidi = 60;  ///< note to calibrate against
 midi_note_t transpose_semitones = 0;
 int note_scale [12] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
-int stdmidi_npeaks = 50;  /* # of peaks to read for calibration */
+int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
 int velo0 = 100;
 int initial_sil_ms = 450;
-double wavebrk_sil_ms = 1.5;
+double wavebrk_sil_ms = 1.5; ///< msecs of silence triggering detection
 double recog_ms = 12;
-double train_max_ms = 250;  // how much to analyze from a waveform
+double train_max_ms = 250;  ///< how much to analyze from a waveform
 
+
+// --- UTILS ---
+
+#define SQR( x ) ((x) * (x))
+
+// sndfile doesn't have it
+static sf_count_t my_sf_tell (SNDFILE *sndfile)
+{ return sf_seek (sndfile, 0, SEEK_CUR); }
+
+static void mutex_cleanup_routine (void *lock_) {
+  pthread_mutex_unlock ((pthread_mutex_t *) lock_);
+}
+#define MUTEX_LOCK_WITH_CLEANUP( lock )                 \
+  pthread_mutex_lock (lock);                            \
+  pthread_cleanup_push (mutex_cleanup_routine, (lock))
+
+static void pack_midi_evt (jack_midi_data_t *buf, midi_note_t note, int velo, int on) {
+  buf [0] = on ? 0x90 : 0x80;
+  buf [1] = note; buf [2] = on ? velo : 0;
+}
+
+static const midi_note_t note_semitones [] = { 0, 2, 4, 5, 7, 9, 11, 12 };
+double note_midi2freq (midi_note_t midi) {
+  return 27.5 * exp (.05776226504666210911 * (midi - 21));  // A0 = 27.5
+}
+void note_midi2sci (midi_note_t midi, char *sci) {
+  midi_note_t o = midi / 12 - 1, s = midi % 12;
+  int sharp = 0;
+  char l;
+  for (l = 'C'; l <= 'I' && note_semitones [l - 'C'] < s; l++);
+  if (note_semitones [l - 'C'] > s) { sharp = 1; l--; }
+  if (l >= 'H') l += 'A' - 'H';
+  sprintf (sci, "%c%d%s", l, o, sharp ? "#" : "");
+}
+midi_note_t note_sci2midi (const char *scinote) {
+  if (! isalpha (scinote [0])) goto bad;
+  char ul = toupper (scinote [0]);
+
+  if (ul >= 'H') goto bad;
+  if (ul < 'C') ul += 'H' - 'A';
+  if (! isdigit (scinote [1])) goto bad;
+  midi_note_t l =  ul - 'C',
+    o = scinote [1] - '0';
+  int sharp = 0;
+  if (scinote [2] == '#') sharp = 1;
+  else if (scinote [2] == 'b') sharp = -1;
+  // else if (scinote [2] != '\0') goto bad;
+
+  return 12 * (o + 1) + note_semitones [l] + sharp;
+
+bad:
+  return MIDI_NOTE_NONE;
+}
+static int scale2bits_aux (const char *name, int *scale, midi_note_t root) {
+  for (int i = 0; i < 12; ++i) {
+    if (name [i] == '0' || name [i] == '1')
+      scale [(root + i) % 12] = name [i] == '1';
+    else return 0;
+  }
+  return 1;
+}
+int scale2bits (const char *name, int *scale) {
+  if (isdigit (name [0])) {
+    return scale2bits_aux (name, scale, 0);
+  } else if (isupper (name [0])) {
+    char sciroot [4] = { name [0], '0', '\0', '\0' };
+    if (name [1] == '#' || name [1] == 'b') sciroot [2] = name++ [1];
+    midi_note_t root = note_sci2midi (sciroot);
+    if (root == MIDI_NOTE_NONE) return 0;
+    if (0 == strcmp (&name [1], "maj"))
+      return scale2bits_aux ("101011010101", scale, root % 12);
+    else if (0 == strcmp (&name [1], "min"))
+      return scale2bits_aux ("101101011010", scale, root % 12);
+  }
+  return 0;
+}
+
+// --- END UTILS ---
+
+
+// --- CLASSES ---
+
+/// An in-memory file.
+/// Its methods contain no cancellation points (except asserts).
 typedef struct {
   char *buf1, *buf2, *ptr, *end, *other;
   size_t sz;
@@ -80,15 +164,17 @@ memfile *memfile_alloc (size_t sz) {
   memfile_init (f, sz, NULL);
   return f;
 }
+/// Switches the active and shadow buffers of @p f.
+/// Locks @p f's switchlock, then its lock.
 void memfile_switchbuf (memfile *f) {
-  pthread_mutex_lock (&f->switchlock);
-  pthread_mutex_lock (&f->lock);
+  MUTEX_LOCK_WITH_CLEANUP (&f->switchlock);
+  MUTEX_LOCK_WITH_CLEANUP (&f->lock);
   assert (f->other != NULL);
   f->other [0] = '\0';
   f->ptr = f->other; f->end = f->other + f->sz;
   f->other = f->other == f->buf1 ? f->buf2 : f->buf1;
-  pthread_mutex_unlock (&f->lock);
-  pthread_mutex_unlock (&f->switchlock);
+  pthread_cleanup_pop (1);
+  pthread_cleanup_pop (1);
 }
 int memfile_vprintf (memfile *f, const char *fmt, va_list ap) {
   int avail = f->end - f->ptr;
@@ -127,22 +213,22 @@ void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
     if (strerror_r (errno, timestr, timestrsz) != 0)
       strcpy (timestr, "<unknown error>");
   }
-  pthread_mutex_lock (&trace_buf->lock);
-  memfile_printf (trace_buf, "%c %s ", trace_level_symb [pri], timestr);
-  va_list ap; va_start (ap, fmt);
-  memfile_vprintf (trace_buf, fmt, ap);
-  if (trace_print_fn) memfile_printf (trace_buf, " [%s]", fn);
-  if (trace_print_tid)
-    memfile_printf (trace_buf, " [tid=0x%X]", (unsigned) pthread_self ());
-  memfile_printf (trace_buf, "\n");
-  pthread_mutex_unlock (&trace_buf->lock);
-  va_end (ap);
+  MUTEX_LOCK_WITH_CLEANUP (&trace_buf->lock); {
+    memfile_printf (trace_buf, "%c %s ", trace_level_symb [pri], timestr);
+    va_list ap; va_start (ap, fmt);
+    memfile_vprintf (trace_buf, fmt, ap);
+    if (trace_print_fn) memfile_printf (trace_buf, " [%s]", fn);
+    if (trace_print_tid)
+      memfile_printf (trace_buf, " [tid=0x%X]", (unsigned) pthread_self ());
+    memfile_printf (trace_buf, "\n");
+    va_end (ap);
+  } pthread_cleanup_pop (1);
 }
 void trace_flush () {
-  pthread_mutex_lock (&trace_buf->switchlock);
-  memfile_switchbuf (trace_buf);
-  fprintf (stdtrace, "%s", trace_buf->other);
-  pthread_mutex_unlock (&trace_buf->switchlock);
+  MUTEX_LOCK_WITH_CLEANUP (&trace_buf->switchlock); {
+    memfile_switchbuf (trace_buf);
+    fprintf (stdtrace, "%s", trace_buf->other);  // cancellation point
+  } pthread_cleanup_pop (1);
   fflush (stdtrace);
 }
 #define TRACE( pri, ... ) trace_msg (pri, __func__, __VA_ARGS__)
@@ -158,7 +244,7 @@ void trace_flush () {
     }                                                                   \
   } while (0)
 
-#if 0
+#if 0  // enable as needed when debugging
 #include <execinfo.h>
 void print_backtrace () {
   void *array[30];
@@ -172,9 +258,6 @@ void print_backtrace () {
 }
 #endif
 
-sf_count_t my_sf_tell (SNDFILE *sndfile)
-{ return sf_seek (sndfile, 0, SEEK_CUR); }
-
 typedef struct {
   int npeaks, max_peak_idx;
   sample_t x, peak, old_peak, max_x, max_peak, noise_peak;
@@ -182,6 +265,10 @@ typedef struct {
   int evt;
 } sample_anl_state;
 enum { ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL };
+void sample_anl_state_init (sample_anl_state *s) {
+  memset (s, 0, sizeof (*s));
+  s->voiced_ago = JACK_MAX_FRAMES;
+}
 
 typedef struct {
   sample_t x;
@@ -223,63 +310,18 @@ int gpt_seq_cmp (const gpt_seq *s1, const gpt_seq *s2) {
   else return 0;
 }
 
-static const midi_note_t note_semitones [] = { 0, 2, 4, 5, 7, 9, 11, 12 };
-double note_midi2freq (midi_note_t midi) {
-  return 27.5 * exp (.05776226504666210911 * (midi - 21));  // A0 = 27.5
-}
-void note_midi2sci (midi_note_t midi, char *sci) {
-  midi_note_t o = midi / 12 - 1, s = midi % 12;
-  int sharp = 0;
-  char l;
-  for (l = 'C'; l <= 'I' && note_semitones [l - 'C'] < s; l++);
-  if (note_semitones [l - 'C'] > s) { sharp = 1; l--; }
-  if (l >= 'H') l += 'A' - 'H';
-  sprintf (sci, "%c%d%s", l, o, sharp ? "#" : "");
-}
-midi_note_t note_sci2midi (const char *scinote) {
-  if (! isalpha (scinote [0])) goto bad;
-  char ul = toupper (scinote [0]);
+// --- END CLASSES ---
 
-  if (ul >= 'H') goto bad;
-  if (ul < 'C') ul += 'H' - 'A';
-  if (! isdigit (scinote [1])) goto bad;
-  midi_note_t l =  ul - 'C',
-    o = scinote [1] - '0';
-  int sharp = 0;
-  if (scinote [2] == '#') sharp = 1;
-  else if (scinote [2] == 'b') sharp = -1;
-  // else if (scinote [2] != '\0') goto bad;
 
-  return 12 * (o + 1) + note_semitones [l] + sharp;
+// --- PROGRAM ---
 
-bad:
-  return MIDI_NOTE_NONE;
-}
-int scale2bits_aux (const char *name, int *scale, midi_note_t root) {
-  for (int i = 0; i < 12; ++i) {
-    if (name [i] == '0' || name [i] == '1')
-      scale [(root + i) % 12] = name [i] == '1';
-    else return 0;
-  }
-  return 1;
-}
-int scale2bits (const char *name, int *scale) {
-  if (isdigit (name [0])) {
-    return scale2bits_aux (name, scale, 0);
-  } else if (isupper (name [0])) {
-    char sciroot [4] = { name [0], '0', '\0', '\0' };
-    if (name [1] == '#' || name [1] == 'b') sciroot [2] = name++ [1];
-    midi_note_t root = note_sci2midi (sciroot);
-    TRACE (TRACE_INT, "scale root %d", (int) root);
-    if (root == MIDI_NOTE_NONE) return 0;
-    if (0 == strcmp (&name [1], "maj"))
-      return scale2bits_aux ("101011010101", scale, root % 12);
-    else if (0 == strcmp (&name [1], "min"))
-      return scale2bits_aux ("101101011010", scale, root % 12);
-  }
-  return 0;
-}
+// ASSERT to be used from main thread and not for general-purpose routines.
+// C assert also works (though not as nicely).
+#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (1));
 
+static void myshutdown (int failure);
+
+// internal vars
 sigset_t sigmask;
 pthread_t poll_thread_tid = 0;
 jack_nframes_t initial_sil_frames = 0,
@@ -291,28 +333,20 @@ jack_client_t *jclient = NULL;
 volatile int zombified = 0;
 jack_nframes_t jmaxbufsz = 0;
 jack_port_t *jport = NULL, *jmidiport = NULL;
-jack_nframes_t jbuf_len = 16384;
+jack_nframes_t jbuf_len = 16384;  // limited by jbufavail semaphore max
 jack_ringbuffer_t *jbuf = NULL, *jmidibuf = NULL;
 sample_t *jdataptr = NULL, *jdataend = NULL;
 jack_nframes_t jdatalen = 0;
 int jbufavail_semid; int jbufavail_valid = 0;
 sem_t jmidibuf_sem;
 sample_t norm_noise_peak = 0;
-sample_anl_state stdmidi_anls;
-sample_t jnorm_factor = 0.0;
-sample_anl_state janls;
+sample_anl_state stdmidi_anls;  // state for calibration note analyzer
+sample_t jnorm_factor = 0.0;  // multiplier against waveform db amplitude
+sample_anl_state janls;  // analyzer state for jack samples
 gridpt *gpt_buf = NULL;
 size_t gpt_buf_max = 0, gpt_buf_len = 0;
 gpt_seq *gpt_seqdb = NULL;
-size_t gpt_seqdb_max = 0, gpt_seqdb_len = 0;
-
-void sample_anl_state_init (sample_anl_state *s) {
-  memset (s, 0, sizeof (*s));
-  s->voiced_ago = 15 * srate;
-}
-
-static void myshutdown (int failure);
-#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (1));
+size_t gpt_seqdb_max = 20000 /* grows */, gpt_seqdb_len = 0;
 
 void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->evt = 0;
@@ -346,7 +380,7 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->x = x;
 }
 
-size_t gpt_buf_dur (int i) {
+static size_t gpt_buf_dur (int i) {
   return (gpt_buf [gpt_buf_len - 1].framecnt - gpt_buf [i].framecnt);
 }
 static float gpt_buf_add (sample_t x, jack_nframes_t count) {
@@ -397,7 +431,7 @@ typedef struct {
   midi_note_t note;
   float dist;
 } gpt_seq_anl_state;
-void gpt_seq_anl_state_init (gpt_seq_anl_state *s) {
+static void gpt_seq_anl_state_init (gpt_seq_anl_state *s) {
   s->note = MIDI_NOTE_NONE;
   s->dist = INFINITY;
 }
@@ -483,7 +517,7 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
 
   goto ret;
 
-ret: (void) 0;
+ret:
   gseq.note = note;
   char buf [2048]; gpt_seq_dump (&gseq, buf, sizeof (buf));
   TRACE (TRACE_INT + 1, "min %d-%d: d=%f d_cn=%f i=%d i_cn=%d seq %s",
@@ -491,7 +525,7 @@ ret: (void) 0;
   free (seq); return note;
 }
 
-static void process_waveform_db () {
+static void load_waveform_db () {
   SF_INFO sf_info; memset (&sf_info, 0, sizeof (sf_info));
   SNDFILE *dbf = sf_open (dbfname, SFM_READ, &sf_info);
   if (NULL == dbf) {
@@ -503,15 +537,16 @@ static void process_waveform_db () {
                dbfname, (int) sf_info.channels);
     myshutdown (1);
   }
+
   srate = sf_info.samplerate;
   initial_sil_frames = srate / 100 * initial_sil_ms / 10;
   wavebrk_sil_frames = srate / 100 * wavebrk_sil_ms / 10;
   recog_frames = srate / 100 * recog_ms / 10;
   train_max_frames = srate / 100 * train_max_ms / 10;
   gpt_buf_max = note_midi2freq (himidi) * recog_ms / 1000 * 64;
+
   gpt_buf = malloc (sizeof (gridpt) * gpt_buf_max);
   ASSERT (gpt_buf != NULL);
-  gpt_seqdb_max = 20000;
   gpt_seqdb = malloc (gpt_seqdb_max * sizeof (gpt_seq));
   ASSERT (gpt_seqdb != NULL);
 
@@ -524,21 +559,18 @@ static void process_waveform_db () {
     analyze_sample (x, &anls);
   }
   norm_noise_peak = anls.noise_peak = 4 * anls.max_x;
-  TRACE (TRACE_DIAG, "Noise peak in db file: %.5f",
-             (float) norm_noise_peak);
+  TRACE (TRACE_DIAG, "Noise peak in db file: %.5f", (float) norm_noise_peak);
 
   for (midi_note_t note = lomidi; note <= himidi; ++note) {
     double note_period = 1 / note_midi2freq (note);
 
     TRACE (TRACE_INT, "Reading MIDI note %d waveform, frame=%ld",
                (int) note, (long) my_sf_tell (dbf));
-    // skip silence
-    while (anls.voiced_ago > 1) {
+    while (anls.voiced_ago > 1) {  // skip silence
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
       analyze_sample (x, &anls);
     }
-    TRACE (TRACE_INT, "Found note at frame=%ld",
-               (long) my_sf_tell (dbf));
+    TRACE (TRACE_INT, "Found note at frame=%ld", (long) my_sf_tell (dbf));
 
     sf_count_t note_pos = my_sf_tell (dbf);
     anls.count = 1;
@@ -557,6 +589,7 @@ static void process_waveform_db () {
                   gpt_buf_add (0, anls.count) > INV_SEMITONE_RATIO);
           }
 #undef TEST
+          // when TEST succeeds a point was added AND completed a sequence:
           while (gpt_buf_dur (0) > (recog_frames + note_period * srate / 4) * SEMITONE_RATIO)
             gpt_buf_shift ();
           gpt_seq_add_all (note, INV_SEMITONE_RATIO * recog_frames);
@@ -565,10 +598,10 @@ static void process_waveform_db () {
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
       analyze_sample (x, &anls);
     } while ((anls.evt & (1 << ANL_EVT_SIL)) == 0);
-
     TRACE (TRACE_INT, "MIDI note %d Waveform ends at frame=%ld, seqs=%d",
            (int) note, (long) my_sf_tell (dbf), gpt_seqdb_len);
-    if (note == stdmidi) {
+
+    if (note == stdmidi) {  // go back and analyze it
       sf_count_t saved_pos = my_sf_tell (dbf);
       sf_seek (dbf, note_pos, SEEK_SET);
       stdanls.npeaks = 0; stdanls.max_peak = 0; stdanls.max_peak_idx = 0;
@@ -584,22 +617,23 @@ static void process_waveform_db () {
           TRACE (TRACE_INT, "Peak at frame %ld %f",
                  (long) my_sf_tell (dbf), (float) stdanls.old_peak);
       }
+      // resume loading of notes
       stdmidi_anls = stdanls;
       sf_seek (dbf, saved_pos, SEEK_SET);
-      TRACE (TRACE_INT, "Returned to frame=%ld",
-                 (long) my_sf_tell (dbf));
+      TRACE (TRACE_INT, "Returned to frame=%ld", (long) my_sf_tell (dbf));
     }
   }
 
   qsort (gpt_seqdb, gpt_seqdb_len, sizeof (gpt_seqdb [0]),
          (int (*) (const void *, const void *)) gpt_seq_cmp);
 
-  for (size_t i = 0; i < gpt_seqdb_len; i++) {
+  for (size_t i = 0; i < gpt_seqdb_len; ++i) {
     char buf [2048]; gpt_seq_dump (&gpt_seqdb [i], buf, sizeof (buf));
     TRACE (TRACE_INT, "seq i=%d %s", i, buf);
     if (i % 10 == 0) trace_flush ();
   }
   TRACE (TRACE_INFO, "%d sequences loaded from waveform db", gpt_seqdb_len);
+
   return;
 
 premature:
@@ -608,7 +642,7 @@ premature:
   myshutdown (1);
 }
 
-sample_t get_jsample () {
+static sample_t get_jsample () {
   int rc;
 
   if (jdataptr == jdataend) {
@@ -620,9 +654,8 @@ sample_t get_jsample () {
         TRACE_PERROR (TRACE_FATAL, "semop");
         myshutdown (1);
       }
-    if (zombified) {
+    if (zombified)
       myshutdown (1);
-    }
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
     jdatalen = jdatainfo [0].len / sizeof (sample_t);
@@ -641,13 +674,6 @@ sample_t get_jsample () {
   return *jdataptr++;
 }
 
-void pack_midi_evt (jack_midi_data_t *buf, midi_note_t note, int velo, int on) {
-  buf [0] = on ? 0x90 : 0x80;
-  buf [1] = note;
-  buf [2] = on ? velo : 0;
-  TRACE (TRACE_INT, "note=%d on=%d", (int) note, on);
-}
-
 static void *process_thread (void *arg) {
   (void) arg;
 
@@ -658,8 +684,7 @@ static void *process_thread (void *arg) {
 
     jack_nframes_t nframes_orig = jack_cycle_wait (jclient),
       nframes = nframes_orig;
-    if (zombified) break;
-    if (0 == jack_port_connected (jport)) {
+    if (0 == nframes || 0 == jack_port_connected (jport)) {
       jack_cycle_signal (jclient, 0);
       continue;
     }
@@ -710,6 +735,7 @@ static void *process_thread (void *arg) {
   return NULL;
 }
 
+/// Calibrates the live signal against the waveform database.
 static void calibrate () {
   sample_t noise_peak;
   sample_anl_state_init (&janls);
@@ -751,7 +777,7 @@ static void calibrate () {
          (janls.evt & (1 << ANL_EVT_SIL)) == 0);
 }
 
-void send_note (midi_note_t note, int on) {
+static void queue_note (midi_note_t note, int on) {
   char ch = note + transpose_semitones; if (on) ch |= 1 << 7;
   jack_ringbuffer_write (jmidibuf, &ch, 1);
 }
@@ -765,7 +791,7 @@ static void midi_server () {
   for (;;) {
     analyze_sample (get_jsample () * jnorm_factor, &janls);
     if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != 0) {
-      send_note (cnote, 0); sem_post (&jmidibuf_sem);
+      queue_note (cnote, 0); sem_post (&jmidibuf_sem);
       cnote = 0;
       gpt_seq_anl_state_init (&gpbs);
       TRACE (TRACE_INFO, "Note off");
@@ -782,15 +808,15 @@ static void midi_server () {
                 gpt_buf_add (0, janls.count) > 1);
         }
 #undef TEST
-        // when a point is added AND completes a sequence
+        // when TEST succeeds a point was added AND completed a sequence:
         while (gpt_buf_dur (1) > recog_frames)
           gpt_buf_shift ();
         midi_note_t note = gpt_seq_analyze (&gpbs);
         if (note != MIDI_NOTE_NONE && note != cnote) {
           int cut_last = cnote != 0;
-          send_note (note, 1);
+          queue_note (note, 1);
           if (cut_last)
-            send_note (cnote, 0);
+            queue_note (cnote, 0);
           sem_post (&jmidibuf_sem); if (cut_last) sem_post (&jmidibuf_sem);
 
           cnote = note;
@@ -806,11 +832,15 @@ static void on_jack_shutdown (void *arg) {
   (void) arg;
 
   zombified = 1;
+  // Wake up get_jsample(). It will test zombified and realize there's no
+  // extra sample.
+  struct sembuf sops = { .sem_num = 0, .sem_op = 1, .sem_flg = 0 };
+  semop (jbufavail_semid, &sops, 1);
   TRACE (TRACE_FATAL, "Jack shut us down");
 }
 
 static void setup_audio () {
-  TRACE (TRACE_INT, "jack setup");
+  TRACE (TRACE_DIAG, "jack setup");
   trace_flush (); fflush(NULL);
 
   if (-1 == (jbufavail_semid = semget (IPC_PRIVATE, 1, IPC_CREAT | S_IRUSR | S_IWUSR))) {
@@ -825,7 +855,7 @@ static void setup_audio () {
   }
   jack_options_t jopt = 0;  // JackNoStartServer;
   jack_status_t jstat;
-  if (NULL == (jclient = jack_client_open (name, jopt, &jstat)))
+  if (NULL == (jclient = jack_client_open (MYNAME, jopt, &jstat)))
     goto jack_setup_fail;
   jack_on_shutdown (jclient, on_jack_shutdown, NULL);
   int jsrate = jack_get_sample_rate (jclient);
@@ -867,7 +897,7 @@ jack_setup_fail:
   myshutdown (1);
 }
 
-void usage (const char *fmt, ...) {
+static void usage (const char *fmt, ...) {
 #define NL "\n"
   if (fmt != NULL) {
     printf ("Error: ");
@@ -964,6 +994,7 @@ static void parse_args (char **argv) {
   }
 }
 
+/// Performs periodic tasks. Stop it with pthread_cancel().
 static void *poll_thread (void *arg) {
   (void) arg;
 
@@ -1000,6 +1031,7 @@ static void cleanup () {
   trace_flush ();
 }
 
+// pitfall: name clash with shutdown(2)
 static void myshutdown (int failure) {
   TRACE (TRACE_INFO, "shutdown requested");
   // print_backtrace ();
@@ -1017,7 +1049,7 @@ static void sig_handler (int sig) {
   pthread_kill (pthread_self (), sig);
 }
 
-void setup_sigs () {
+static void setup_sigs () {
   int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT, SIGALRM };
   sigemptyset (&sigmask);
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
@@ -1043,7 +1075,7 @@ int main (int argc, char **argv) {
 
   parse_args (argv);
 
-  process_waveform_db ();
+  load_waveform_db ();
 
   setup_audio ();
 
@@ -1053,7 +1085,7 @@ int main (int argc, char **argv) {
 
   midi_server ();
 
-  myshutdown (0); return EXIT_SUCCESS;
+  myshutdown (0); assert (0);
 }
 
 /*
