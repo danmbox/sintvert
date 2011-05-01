@@ -75,7 +75,7 @@ static void mutex_cleanup_routine (void *lock_) {
   pthread_mutex_lock (lock);                            \
   pthread_cleanup_push (mutex_cleanup_routine, (lock))
 
-static void pack_midi_evt (jack_midi_data_t *buf, midi_note_t note, int on) {
+static void pack_midi_note_evt (jack_midi_data_t *buf, midi_note_t note, int on) {
   buf [0] = (on ? 0x90 : 0x80) | midi_chan;
   buf [1] = note; buf [2] = on ? velo_on : velo_off;
 }
@@ -238,9 +238,9 @@ void trace_flush () {
   fflush (stdtrace);
 }
 #define TRACE( pri, ... ) trace_msg (pri, __func__, __VA_ARGS__)
-#define TRACE_PERROR( pri, called) do {                     \
-    char buf [1000]; strerror_r (errno, buf, sizeof (buf)); \
-    TRACE (pri, "%s: %s", called, buf);                     \
+#define TRACE_PERROR( pri, called ) do {                            \
+    char buf [1000]; strerror_r (errno, buf, sizeof (buf));         \
+    TRACE (pri, "Error: %s (%s:%d): %s", called, __FILE__, __LINE__, buf); \
   } while (0)
 #define TRACE_ASSERT( cond_, fail ) do {                                \
     if (! (cond_)) {                                                    \
@@ -249,7 +249,6 @@ void trace_flush () {
       fail;                                                             \
     }                                                                   \
   } while (0)
-
 #if 0  // enable as needed when debugging
 #include <execinfo.h>
 void print_backtrace () {
@@ -342,29 +341,50 @@ int gpt_seq_cmp (const gpt_seq *s1, const gpt_seq *s2) {
 
 // ASSERT to be used from main thread and not for general-purpose routines.
 // C assert also works (though not as nicely).
-#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (1));
-
 static void myshutdown (int failure);
+
+#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (1));
+#define ENSURE_SYSCALL( syscall, args )                          \
+  do {                                                           \
+    if (-1 == (syscall args)) {                                   \
+      TRACE_PERROR (TRACE_FATAL, #syscall); myshutdown (1);      \
+    }                                                            \
+  } while (0)
+// E.g. ENSURE_CALL (myfun, (arg1, arg2) != 0)
+#define ENSURE_CALL( call, args)                                        \
+  do {                                                                  \
+    if (call args) {                                                    \
+      TRACE (TRACE_FATAL, #call " failed (%s:%d)", __FILE__, __LINE__); \
+      myshutdown (1);                                                   \
+    }                                                                   \
+  } while (0)
+#define ENSURE_CALL_AND_SAVE( call, args, rc, bad )                     \
+  do {                                                                  \
+    if (bad == (rc = (call args))) {                                    \
+      TRACE (TRACE_FATAL, #call " failed (%s:%d)", __FILE__, __LINE__); \
+      myshutdown (1);                                                   \
+    }                                                                   \
+  } while (0)
 
 // internal vars
 sigset_t sigmask;
-pthread_t poll_thread_tid = 0;
+pthread_t poll_thread_tid = 0; int poll_thread_started = 0;
 jack_nframes_t initial_sil_frames = 0,
   wavebrk_sil_frames = 0,
   recog_frames = 0,
   train_max_frames = 0;
 jack_nframes_t srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
-volatile int zombified = 0;
+sem_t zombified;
 jack_port_t *jport = NULL, *jmidiport = NULL;
 jack_ringbuffer_t *jbuf = NULL,  ///< Incoming audio buffer
   *jmidibuf = NULL;  ///< Outgoing MIDI buffer
 /// Size of @c jbuf.
 /// Limited by jbufavail semaphore max.
 jack_nframes_t jbuf_len = 16384;
-int jbufavail_semid;  ///< Counting semaphore for @c jbuf
+int jbufavail_semid;  ///< Counting semaphore for @c jbuf (in samples)
 int jbufavail_valid = 0;  ///< Is @c jbufavail_semid active?
-sem_t jmidibuf_sem;  ///< Counting semaphore for @c jmidibuf
+sem_t jmidibuf_sem;  ///< Counting semaphore for @c jmidibuf (in events)
 sample_t norm_noise_peak = 0;  ///< Estimated noise amplitude in training file
 sample_anl_state stdmidi_anls;  ///< State for calibration note analyzer
 sample_t jnorm_factor = 0.0;  ///< Multiplier against training file loudness
@@ -684,7 +704,7 @@ static sample_t get_jsample () {
         TRACE_PERROR (TRACE_FATAL, "semop");
         myshutdown (1);
       }
-    if (zombified) myshutdown (1);
+    if (0 == sem_trywait (&zombified)) myshutdown (1);
 
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
@@ -728,7 +748,7 @@ static void *process_thread (void *arg) {
         TRACE (TRACE_WARN, "MIDI note lost");
         break;
       }
-      pack_midi_evt (evt, ch & ((1 << 7) - 1), (ch & (1 << 7)) != 0);
+      pack_midi_note_evt (evt, ch & ((1 << 7) - 1), (ch & (1 << 7)) != 0);
     }
 
     sample_t *in = jack_port_get_buffer (jport, nframes);
@@ -762,7 +782,6 @@ static void *process_thread (void *arg) {
 /// Calibrates the live signal against the waveform database.
 static void calibrate () {
   sample_t noise_peak;
-  sample_anl_state_init (&janls);
 
   // find noise level
   TRACE (TRACE_DIAG, "Analysing noise...");
@@ -855,7 +874,7 @@ static void midi_server () {
 static void on_jack_shutdown (void *arg) {
   (void) arg;
 
-  zombified = 1;
+  sem_post (&zombified);
   // Wake up get_jsample(). It will test zombified and realize there's no
   // extra sample.
   struct sembuf sops = { .sem_num = 0, .sem_op = 1, .sem_flg = 0 };
@@ -867,26 +886,21 @@ static void setup_audio () {
   TRACE (TRACE_DIAG, "jack setup");
   trace_flush (); fflush(NULL);
 
-  if (-1 == (jbufavail_semid = semget (IPC_PRIVATE, 1, IPC_CREAT | S_IRUSR | S_IWUSR))) {
-    TRACE_PERROR (TRACE_FATAL, "semget");
-    myshutdown (1);
-  }
+  ENSURE_SYSCALL (jbufavail_semid = semget, (IPC_PRIVATE, 1, IPC_CREAT | S_IRUSR | S_IWUSR));
   jbufavail_valid = 1;
   semctl_arg_t semarg = { .val = 0 };
-  if (-1 == semctl (jbufavail_semid, 0, SETVAL, semarg)) {
-    TRACE_PERROR (TRACE_FATAL, "semctl");
-    myshutdown (1);
-  }
+  ENSURE_SYSCALL (semctl, (jbufavail_semid, 0, SETVAL, semarg));
+
   jack_options_t jopt = 0;  // JackNoStartServer;
   jack_status_t jstat;
-  if (NULL == (jclient = jack_client_open (MYNAME, jopt, &jstat)))
-    goto jack_setup_fail;
+  ENSURE_CALL_AND_SAVE (jack_client_open, (MYNAME, jopt, &jstat), jclient, NULL);
   jack_on_shutdown (jclient, on_jack_shutdown, NULL);
+
   jack_nframes_t jsrate = jack_get_sample_rate (jclient);
   if (jsrate != srate) {
     TRACE (TRACE_FATAL, "Sample rate %d does not match training file's (%d)",
            jsrate, srate);
-    goto jack_setup_fail;
+    myshutdown (1);
   }
 
   jack_nframes_t jmaxbufsz = jack_get_buffer_size (jclient);
@@ -895,30 +909,22 @@ static void setup_audio () {
   jbuf = jack_ringbuffer_create (jbuf_len * sizeof (sample_t)); ASSERT (jbuf != NULL);
   jmidibuf = jack_ringbuffer_create (128); ASSERT (jmidibuf != NULL);
 
-  if (0 != jack_set_process_thread (jclient, process_thread, NULL))
-    goto jack_setup_fail;
+  sample_anl_state_init (&janls);
 
-  if (NULL == (jport = jack_port_register (jclient, "in", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0)))
-    goto jack_setup_fail;
-  if (NULL == (jmidiport = jack_port_register (jclient, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0)))
-    goto jack_setup_fail;
+  ENSURE_CALL (jack_set_process_thread, (jclient, process_thread, NULL) != 0);
 
-  if (0 != jack_activate (jclient))
-    goto jack_setup_fail;
+  ENSURE_CALL_AND_SAVE (jack_port_register, (jclient, "in", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0), jport, NULL);
+  ENSURE_CALL_AND_SAVE (jack_port_register, (jclient, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0), jmidiport, NULL);
 
-  if (NULL != dstport && 0 != jack_connect (jclient, jack_port_name (jmidiport), dstport))
-    goto jack_setup_fail;
+  ENSURE_CALL (jack_activate, (jclient) != 0);
 
-  if (NULL != srcport && 0 != jack_connect (jclient, srcport, jack_port_name (jport)))
-    goto jack_setup_fail;
+  if (NULL != dstport)
+    ENSURE_CALL (jack_connect, (jclient, jack_port_name (jmidiport), dstport) != 0);
+
+  if (NULL != srcport)
+    ENSURE_CALL (jack_connect, (jclient, srcport, jack_port_name (jport)) != 0);
 
   TRACE (TRACE_DIAG, "Activated");
-
-  return;
-
-jack_setup_fail:
-  TRACE (TRACE_FATAL, "Jack setup failed");
-  myshutdown (1);
 }
 
 static void usage (const char *fmt, ...) {
@@ -1045,8 +1051,8 @@ static void *poll_thread (void *arg) {
   (void) arg;
 
   for (;;) {
-    struct timespec sleepreq = { tv_sec: 0, tv_nsec: 200000000L };
     trace_flush ();
+    struct timespec sleepreq = { tv_sec: 0, tv_nsec: 200000000L };
     nanosleep (&sleepreq, NULL);
   }
 
@@ -1057,13 +1063,14 @@ static void init_trace () {
   trace_buf = memfile_alloc (1 << 19);
   stdtrace = fdopen (dup (fileno (stdout)), "w");
   setvbuf (stdtrace, NULL, _IONBF, 0);
-  pthread_create (&poll_thread_tid, NULL, poll_thread, NULL);
   TRACE (TRACE_INFO, "Logging enabled, level=%d", (int) trace_level);
 }
 
 static void cleanup () {
-  pthread_cancel (poll_thread_tid);
-  pthread_join (poll_thread_tid, NULL);
+  if (poll_thread_started) {
+    pthread_cancel (poll_thread_tid);
+    pthread_join (poll_thread_tid, NULL);
+  }
   if (jclient != NULL) {
     jack_on_shutdown (jclient, NULL, NULL);
     jack_client_close (jclient);
@@ -1097,29 +1104,35 @@ static void sig_handler (int sig) {
 
 static void setup_sigs () {
   int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT, SIGALRM };
-  sigemptyset (&sigmask);
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
-    sigaddset (&sigmask, sigarr [i]);
-  if (0 != pthread_sigmask (SIG_BLOCK, &sigmask, NULL)) goto err;
+    ENSURE_SYSCALL (sigaddset, (&sigmask, sigarr [i]));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
   struct sigaction act =
     { .sa_mask = sigmask, .sa_flags = 0, .sa_handler = sig_handler };
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
-    if (0 != sigaction (sigarr [i], &act, NULL))
-      goto err;
+    ENSURE_SYSCALL (sigaction, (sigarr [i], &act, NULL));
+}
 
-  return;
-
-err: perror (__func__); exit (EXIT_FAILURE);
+/// Initialize variables and resources that cannot be initialized statically.
+/// Postcondition: all globals must be in a defined state.
+void init_globals () {
+  ENSURE_SYSCALL (sigemptyset, (&sigmask));
+  ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
+  ENSURE_SYSCALL (sem_init, (&jmidibuf_sem, 0, 0));
 }
 
 int main (int argc, char **argv) {
   (void) argc;
 
-  setup_sigs ();
-
   init_trace ();
 
+  init_globals ();
+
+  setup_sigs ();
+
   parse_args (argv);
+
+  pthread_create (&poll_thread_tid, NULL, poll_thread, NULL);
 
   load_waveform_db ();
 
@@ -1136,19 +1149,25 @@ int main (int argc, char **argv) {
 
 /*
 
+  About transferring data between process thread and main:
+
   XSI semaphores + threads aren't portable, and POSIX semaphores only increment
-  by 1.
+  by 1. If jack buffer size is constant, semaphore unit can be buffers.
 
-  Mutexes are subject to (possibly unbounded) priority inversion.
+  Mutexes are subject to (possibly unbounded) priority inversion, so condition
+  var signalling is out.
 
-  Pipes have an unpredictable buffer size and require syscalls.
+  Pipes have unpredictable max size and require slow syscalls.
 
-  pthread_mutex_trylock + keep an unannounced_data_count (per thread): mutex
-  may happen to be taken when queried until reader exhausts data. We could
-  use a thread-local ringbuffer to store unannounced data.
+  pthread_mutex_trylock + keep an unannounced_data ringbuffer (per thread): mutex
+  may happen to be taken when queried until reader exhausts data, so local
+  ringbuffer must be as large as global one. One extra level of data copying.
 
   Unsynchronized "single-writer" paradigm issues: atomicity of pointers, cache
-  coherency, compiler / pipeline write reordering.
+  coherency, compiler / pipeline write reordering. In particular, both the
+  producer and the consummer read the other's pointer when checking for
+  available bytes / space. Under-estimations are no big deal but overestimations
+  can lead to bogus or lost data.
 
 */
 
