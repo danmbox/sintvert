@@ -10,7 +10,7 @@ Author: Dan A. Muresan (danmbox at gmail dot com)
 sintvert needs a mono recording containing all the notes of the
 chromatic scale to be recognized, with short pauses in between. Create
 this file by recording output from your keyboard or synthesizer. Try
-to pick "clean" patch, i.e. one which has no echo (there is no sound
+to pick a "clean" patch, i.e. one which has no echo (there is no sound
 after you release a key) and which looks as close as possible to a
 sine wave.
 

@@ -1,3 +1,6 @@
+// Copyright (C) 2010-2011 Dan Muresan
+// Part of sintvert (http://danmbox.github.com/sintvert/)
+
 #define _XOPEN_SOURCE 600
 
 #include <stdio.h>
@@ -768,6 +771,8 @@ NL "keyboard or synthesizer once for calibration (prior to this step you must"
 NL "connect " MYNAME " to Jack manually if -p was not given). The program"
 NL "estimates the loudness of the input signal compared to the training file, "
 NL "then starts recognizing notes and sending MIDI messages until killed."
+NL ""
+NL "Report bugs at https://github.com/danmbox/sintvert/issues"
  );
 #undef NL
 
@@ -824,7 +829,7 @@ static void parse_args (char **argv) {
         int l;
         if (sscanf (*++argv, "%d", &l) != 1)
           usage ("Bad log level %s", *argv);
-        TRACE (TRACE_IMPT, "Log level %d", l);
+        TRACE (TRACE_IMPT, "Log level %d -> %d", (int) trace_level, l);
         trace_level = l;
       } else if (0 == strcmp (*argv, "--log-tid")) {
         trace_print_tid = 1;

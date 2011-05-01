@@ -1,3 +1,6 @@
+// Copyright (C) 2010-2011 Dan Muresan
+// Part of sintvert (http://danmbox.github.com/sintvert/)
+
 #include <string.h>
 
 #include <errno.h>
@@ -10,11 +13,11 @@
 typedef enum {
   TRACE_NONE, TRACE_FATAL, TRACE_ERR, TRACE_WARN, TRACE_IMPT, TRACE_INFO, TRACE_DIAG, TRACE_INT
 } trace_pri_t;
-const char *trace_level_symb = "-FEW!ID                                   ";
-trace_pri_t trace_level = TRACE_INT;
-int trace_print_tid = 0, trace_print_fn = 0;
-memfile *trace_buf = NULL;
-FILE *stdtrace = NULL;
+static const char *trace_level_symb = "-FEW!ID                                   ";
+static trace_pri_t trace_level = TRACE_INFO;
+static int trace_print_tid = 0, trace_print_fn = 0;
+static memfile *trace_buf = NULL;
+static FILE *stdtrace = NULL;
 static void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
   if (pri > trace_level) return;
   struct timeval tv;

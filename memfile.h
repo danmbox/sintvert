@@ -1,3 +1,6 @@
+// Copyright (C) 2010-2011 Dan Muresan
+// Part of sintvert (http://danmbox.github.com/sintvert/)
+
 #ifndef __SINTVERT_MEMFILE_H
 #define __SINTVERT_MEMFILE_H
 
