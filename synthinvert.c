@@ -88,7 +88,7 @@ void note_midi2sci (midi_note_t midi, char *sci) {
   midi_note_t o = midi / 12 - 1, s = midi % 12;
   int sharp = 0;
   char l;
-  for (l = 'C'; l <= 'I' && note_semitones [l - 'C'] < s; l++);
+  for (l = 'C'; l <= 'I' && note_semitones [l - 'C'] < s; ++l);
   if (note_semitones [l - 'C'] > s) { sharp = 1; l--; }
   if (l >= 'H') l += 'A' - 'H';
   sprintf (sci, "%c%d%s", l, o, sharp ? "#" : "");
@@ -314,7 +314,7 @@ static char *gpt_seq_dump (const gpt_seq *gseq, char *buf, size_t sz) {
   memfile mf; memfile_init (&mf, sz, buf);
   memfile_printf (&mf, "l=%d t=%d dur=%d note=%d",
                   gseq->length, gseq->type, (int) gseq->dur, (int) gseq->note);
-  for (size_t i = 0; i < gseq->length; i++)
+  for (size_t i = 0; i < gseq->length; ++i)
     memfile_printf (&mf, " (%f %d)", gseq->seq [i].x, gseq->seq [i].framecnt);
   return buf;
 }
@@ -353,7 +353,7 @@ jack_nframes_t initial_sil_frames = 0,
   wavebrk_sil_frames = 0,
   recog_frames = 0,
   train_max_frames = 0;
-long srate = 0;  ///< Sampling rate
+jack_nframes_t srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
 volatile int zombified = 0;
 jack_port_t *jport = NULL, *jmidiport = NULL;
@@ -488,8 +488,6 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
 
   gpt_seq gseq_lo = gseq; gseq_lo.dur *= INV_SEMITONE_RATIO;
   gpt_seq gseq_hi = gseq; gseq_hi.dur *= SEMITONE_RATIO;
-  if (gpt_seq_cmp (&gseq_hi, &gpt_seqdb [gpt_seqdb_len - 1]) > 0)
-    gseq_hi = gpt_seqdb [gpt_seqdb_len - 1];
   size_t lo = 0, hi = gpt_seqdb_len - 1, i = 0;
   int rc = gpt_seq_search (&gseq_lo, lo, hi + 1, &lo);
   if (rc != 0) {
@@ -500,14 +498,15 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
     else if (rc1 > 0) goto ret;
   }
 
-  for (i = lo; gpt_seq_cmp (&gpt_seqdb [i], &gseq_hi) <= 0; ++i) {
+  for (i = lo; i < gpt_seqdb_len && gpt_seq_cmp (&gpt_seqdb [i], &gseq_hi) <= 0; ++i)
+  {
     midi_note_t newnote = gpt_seqdb [i].note;
     if (! note_scale [newnote % 12]) continue;
     gridpt *seq2 = gpt_seqdb [i].seq;
     float dscale = (double) SQR (gpt_seqdb [i].dur) / (gpt_buf_len - 1);
     sample_t dist = 0.0;
     size_t j = 0;
-    for (; j < gpt_buf_len; j++) {
+    for (; j < gpt_buf_len; ++j) {
       sample_t x = seq [j].x;
       if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
       jack_nframes_t l = seq [j].framecnt, l2 = seq2 [j].framecnt;
@@ -685,8 +684,8 @@ static sample_t get_jsample () {
         TRACE_PERROR (TRACE_FATAL, "semop");
         myshutdown (1);
       }
-    if (zombified)
-      myshutdown (1);
+    if (zombified) myshutdown (1);
+
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
     jdatalen = jdatainfo [0].len / sizeof (sample_t);
@@ -720,22 +719,16 @@ static void *process_thread (void *arg) {
       continue;
     }
 
-    jack_midi_data_t evt [24];
-    size_t evtcnt = 0;
-    for (; evtcnt < sizeof (evt) / sizeof (evt [0]) / 3
-           && 0 == sem_trywait (&jmidibuf_sem);
-         ++evtcnt)
-    {
-      char ch;
-      jack_ringbuffer_read (jmidibuf, &ch, 1);
-      pack_midi_evt (&evt [evtcnt * 3],
-                     ch & ((1 << 7) - 1), (ch & (1 << 7)) != 0);
-    }
     void *out = jack_port_get_buffer (jmidiport, nframes);
     jack_midi_clear_buffer (out);
-    if (evtcnt > 0) {
-      for (size_t i = 0; i < evtcnt; ++i)
-        jack_midi_event_write (out, 0, evt + 3 * i, sizeof (evt [0]) * 3);
+    while (0 == sem_trywait (&jmidibuf_sem)) {
+      char ch; jack_ringbuffer_read (jmidibuf, &ch, 1);
+      jack_midi_data_t *evt = jack_midi_event_reserve (out, 0, 3);
+      if (evt == NULL) {
+        TRACE (TRACE_WARN, "MIDI note lost");
+        break;
+      }
+      pack_midi_evt (evt, ch & ((1 << 7) - 1), (ch & (1 << 7)) != 0);
     }
 
     sample_t *in = jack_port_get_buffer (jport, nframes);
@@ -754,9 +747,9 @@ static void *process_thread (void *arg) {
       semop (jbufavail_semid, &sops, 1);
     }
     lost_frames += nframes_orig - nframes;
-    if (lost_frames > 0) {
+    if (lost_frames > srate / 50) {
       if (0 == pthread_mutex_trylock (&trace_buf->lock)) {
-        //TRACE (TRACE_WARN, "Lost frames %d", (int) lost_frames);
+        TRACE (TRACE_WARN, "Lost frames %d", (int) lost_frames);
         lost_frames = 0;
         pthread_mutex_unlock (&trace_buf->lock);
       }
@@ -830,7 +823,7 @@ static void midi_server () {
     }
     if ((janls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0)
     {
-      for (int part = 0; part < 2; part++) {
+      for (int part = 0; part < 2; ++part) {
 #define TEST( part, cond ) case part: if (! (cond)) continue; break
         switch (part) {
           TEST (0, (janls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
@@ -889,7 +882,7 @@ static void setup_audio () {
   if (NULL == (jclient = jack_client_open (MYNAME, jopt, &jstat)))
     goto jack_setup_fail;
   jack_on_shutdown (jclient, on_jack_shutdown, NULL);
-  int jsrate = jack_get_sample_rate (jclient);
+  jack_nframes_t jsrate = jack_get_sample_rate (jclient);
   if (jsrate != srate) {
     TRACE (TRACE_FATAL, "Sample rate %d does not match training file's (%d)",
            jsrate, srate);
