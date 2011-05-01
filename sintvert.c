@@ -1173,12 +1173,12 @@ int main (int argc, char **argv) {
 
 // Local Variables:
 // write-file-functions: (lambda () (delete-trailing-whitespace) nil)
-// compile-command: "cc -Os -g -std=c99 -pthread -Wall -Wextra -march=native -pipe -ljack -lsndfile -lm synthinvert.c -o synthinvert"
+// compile-command: "cc -Os -g -std=c99 -pthread -Wall -Wextra -march=native -pipe -ljack -lsndfile -lm sintvert.c -o sintvert"
 // End:
 
 /*
   Compile with:
 
-  cc -Os -g -std=c99 -D_REENTRANT -Wall -Wextra $CFLAGS -ljack -lsndfile -lm synthinvert.c -o synthinvert
+  cc -Os -g -std=c99 -D_REENTRANT -Wall -Wextra $CFLAGS -ljack -lsndfile -lm sintvert.c -o sintvert
   # -fmudflapth -lmudflapth
 */
