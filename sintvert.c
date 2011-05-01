@@ -4,15 +4,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
-#include <stdarg.h>
 #include <string.h>
 #include <math.h>
-#include <ctype.h>
 #include <assert.h>
 
-#include <errno.h>
-#include <time.h>
-#include <sys/time.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -27,13 +22,11 @@
 #include <jack/ringbuffer.h>
 #include <sndfile.h>
 
+#include "trace.h"
+#include "midiutil.h"
 
 // type aliases & constants
 #define MYNAME "sintvert"
-typedef int midi_note_t;  ///< A MIDI note (0-127, 21=A0, 60=C4)
-#define MIDI_NOTE_NONE ((midi_note_t) -1)
-double SEMITONE_RATIO = 1.06, INV_SEMITONE_RATIO = 0.94,
-  QTTONE_RATIO = 1.03, QTTONE_RATIO_INV = 0.97;
 typedef jack_default_audio_sample_t sample_t;
 typedef union {  // POSIX requires *us* to declare it instead of <sys/sem.h>
   int val; struct semid_ds *buf; unsigned short *array;
@@ -66,202 +59,15 @@ const char *srcport = NULL, *dstport = NULL;
 static sf_count_t my_sf_tell (SNDFILE *sndfile)
 { return sf_seek (sndfile, 0, SEEK_CUR); }
 
-static void mutex_cleanup_routine (void *lock_) {
-  pthread_mutex_unlock ((pthread_mutex_t *) lock_);
-}
-/// Locks a mutex and pushes a @c pthread_cleanup routine.
-/// Must be matched with a <code>pthread_cleanup_pop (1)</code>
-#define MUTEX_LOCK_WITH_CLEANUP( lock )                 \
-  pthread_mutex_lock (lock);                            \
-  pthread_cleanup_push (mutex_cleanup_routine, (lock))
-
 static void pack_midi_note_evt (jack_midi_data_t *buf, midi_note_t note, int on) {
   buf [0] = (on ? 0x90 : 0x80) | midi_chan;
   buf [1] = note; buf [2] = on ? velo_on : velo_off;
-}
-
-static const midi_note_t note_semitones [] = { 0, 2, 4, 5, 7, 9, 11, 12 };
-double note_midi2freq (midi_note_t midi) {
-  return 27.5 * exp (.05776226504666210911 * (midi - 21));  // A0 = 27.5
-}
-void note_midi2sci (midi_note_t midi, char *sci) {
-  midi_note_t o = midi / 12 - 1, s = midi % 12;
-  int sharp = 0;
-  char l;
-  for (l = 'C'; l <= 'I' && note_semitones [l - 'C'] < s; ++l);
-  if (note_semitones [l - 'C'] > s) { sharp = 1; l--; }
-  if (l >= 'H') l += 'A' - 'H';
-  sprintf (sci, "%c%d%s", l, o, sharp ? "#" : "");
-}
-midi_note_t note_sci2midi (const char *scinote) {
-  if (! isalpha (scinote [0])) goto bad;
-  char ul = toupper (scinote [0]);
-
-  if (ul >= 'H') goto bad;
-  if (ul < 'C') ul += 'H' - 'A';
-  if (! isdigit (scinote [1])) goto bad;
-  midi_note_t l =  ul - 'C',
-    o = scinote [1] - '0';
-  int sharp = 0;
-  if (scinote [2] == '#') sharp = 1;
-  else if (scinote [2] == 'b') sharp = -1;
-  // else if (scinote [2] != '\0') goto bad;
-
-  return 12 * (o + 1) + note_semitones [l] + sharp;
-
-bad:
-  return MIDI_NOTE_NONE;
-}
-static int scale2bits_aux (const char *name, int *scale, midi_note_t root) {
-  for (int i = 0; i < 12; ++i) {
-    if (name [i] == '0' || name [i] == '1')
-      scale [(root + i) % 12] = name [i] == '1';
-    else return 0;
-  }
-  return 1;
-}
-int scale2bits (const char *name, int *scale) {
-  if (isdigit (name [0])) {
-    return scale2bits_aux (name, scale, 0);
-  } else if (isupper (name [0])) {
-    char sciroot [4] = { name [0], '0', '\0', '\0' };
-    if (name [1] == '#' || name [1] == 'b') sciroot [2] = name++ [1];
-    midi_note_t root = note_sci2midi (sciroot);
-    if (root == MIDI_NOTE_NONE) return 0;
-    if (0 == strcmp (&name [1], "maj"))
-      return scale2bits_aux ("101011010101", scale, root % 12);
-    else if (0 == strcmp (&name [1], "min"))
-      return scale2bits_aux ("101101011010", scale, root % 12);
-  }
-  return 0;
 }
 
 // --- END UTILS ---
 
 
 // --- CLASSES ---
-
-/// An in-memory file.
-/// Its methods contain no cancellation points (except asserts).
-typedef struct {
-  char *buf1, *buf2, *ptr, *end, *other;
-  size_t sz;
-  pthread_mutex_t lock, switchlock;
-} memfile;
-void memfile_init (memfile *f, size_t sz, char *buf1) {
-  f->sz = sz;
-  if (buf1 == NULL) {
-    f->buf1 = calloc (sz, 1); f->buf2 = calloc (sz, 1);
-    assert (f->buf1 != NULL && f->buf2 != NULL);
-  } else {
-    f->buf1 = buf1; f->buf2 = NULL;
-  }
-  f->ptr = f->buf1; f->end = f->ptr + f->sz; f->other = f->buf2;
-  pthread_mutexattr_t lattr;
-  pthread_mutexattr_init (&lattr);
-  pthread_mutexattr_settype (&lattr, PTHREAD_MUTEX_RECURSIVE);
-  pthread_mutex_init (&f->lock, &lattr);
-  pthread_mutex_init (&f->switchlock, &lattr);
-  pthread_mutexattr_destroy (&lattr);
-}
-memfile *memfile_alloc (size_t sz) {
-  memfile *f = malloc (sizeof (memfile));
-  assert (f != NULL);
-  memfile_init (f, sz, NULL);
-  return f;
-}
-/// Switches the active and shadow buffers of @p f.
-/// Locks @p f's switchlock, then its lock.
-void memfile_switchbuf (memfile *f) {
-  MUTEX_LOCK_WITH_CLEANUP (&f->switchlock);
-  MUTEX_LOCK_WITH_CLEANUP (&f->lock);
-  assert (f->other != NULL);
-  f->other [0] = '\0';
-  f->ptr = f->other; f->end = f->other + f->sz;
-  f->other = f->other == f->buf1 ? f->buf2 : f->buf1;
-  pthread_cleanup_pop (1);
-  pthread_cleanup_pop (1);
-}
-int memfile_vprintf (memfile *f, const char *fmt, va_list ap) {
-  int avail = f->end - f->ptr;
-  int written = vsnprintf (f->ptr, avail, fmt, ap);
-  f->ptr += written; if (f->ptr > f->end) f->ptr = f->end;
-  return written;
-}
-int memfile_printf (memfile *f, const char *fmt, ...) {
-  va_list ap; va_start (ap, fmt);
-  int written = memfile_vprintf (f, fmt, ap);
-  va_end (ap);
-  return written;
-}
-
-typedef enum {
-  TRACE_NONE, TRACE_FATAL, TRACE_ERR, TRACE_WARN, TRACE_IMPT, TRACE_INFO, TRACE_DIAG, TRACE_INT
-} trace_pri_t;
-const char *trace_level_symb = "-FEW!ID                                   ";
-trace_pri_t trace_level = TRACE_INT;
-int trace_print_tid = 0, trace_print_fn = 0;
-memfile *trace_buf = NULL;
-FILE *stdtrace = NULL;
-void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
-  if (pri > trace_level) return;
-  struct timeval tv;
-  char timestr [80];
-  size_t timestrsz = sizeof (timestr) - 3;
-  if (gettimeofday (&tv, NULL) == 0) {
-    struct tm t;
-    if (localtime_r (& tv.tv_sec, &t) == NULL)
-      strcpy (timestr, "<unknown error>");
-    char *timestrp = timestr +
-      strftime (timestr, timestrsz, "%Y-%m-%d %H:%M:%S.", &t);
-    snprintf (timestrp, 4, "%03d", (int) (tv.tv_usec / 1000));
-  } else {
-    if (strerror_r (errno, timestr, timestrsz) != 0)
-      strcpy (timestr, "<unknown error>");
-  }
-  MUTEX_LOCK_WITH_CLEANUP (&trace_buf->lock); {
-    memfile_printf (trace_buf, "%c %s ", trace_level_symb [pri], timestr);
-    va_list ap; va_start (ap, fmt);
-    memfile_vprintf (trace_buf, fmt, ap);
-    if (trace_print_fn) memfile_printf (trace_buf, " [%s]", fn);
-    if (trace_print_tid)
-      memfile_printf (trace_buf, " [tid=0x%X]", (unsigned) pthread_self ());
-    memfile_printf (trace_buf, "\n");
-    va_end (ap);
-  } pthread_cleanup_pop (1);
-}
-void trace_flush () {
-  MUTEX_LOCK_WITH_CLEANUP (&trace_buf->switchlock); {
-    memfile_switchbuf (trace_buf);
-    fprintf (stdtrace, "%s", trace_buf->other);  // cancellation point
-  } pthread_cleanup_pop (1);
-  fflush (stdtrace);
-}
-#define TRACE( pri, ... ) trace_msg (pri, __func__, __VA_ARGS__)
-#define TRACE_PERROR( pri, called ) do {                            \
-    char buf [1000]; strerror_r (errno, buf, sizeof (buf));         \
-    TRACE (pri, "Error: %s (%s:%d): %s", called, __FILE__, __LINE__, buf); \
-  } while (0)
-#define TRACE_ASSERT( cond_, fail ) do {                                \
-    if (! (cond_)) {                                                    \
-      TRACE (TRACE_FATAL, "Assertion %s failed (%s:%d)",                \
-             #cond_, __FILE__, __LINE__);                               \
-      fail;                                                             \
-    }                                                                   \
-  } while (0)
-#if 0  // enable as needed when debugging
-#include <execinfo.h>
-void print_backtrace () {
-  void *array[30];
-  size_t size = backtrace (array, 30);
-  char **strings = backtrace_symbols (array, size);
-
-  TRACE (TRACE_DIAG, "Obtained %zd stack frames", size);
-  for (size_t i = 0; i < size; ++i)
-    TRACE (TRACE_DIAG, "%s", strings [i]);
-  free (strings);
-}
-#endif
 
 typedef struct {
   int npeaks,  ///< Total number of peaks
