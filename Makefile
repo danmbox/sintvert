@@ -33,7 +33,7 @@ CLEAN_FILES := $(MANS) $(PROGS)
 all: $(PROGS) $(MANS)
 
 sintvert: sintvert.c Makefile
-	$(CC) -std=c99 -D_REENTRANT -ljack -lsndfile -lm  -lpthread -lrt $< -o $@
+	$(CC) $(CFLAGS) -std=c99 -D_REENTRANT -ljack -lsndfile -lm  -lpthread -lrt $< -o $@
 
 man/%.1: % $(filter-out $(wildcard man), man) Makefile
 	help2man -N -o $@ $(abspath $<) || { $< --help || :; $< --version || :; false; }
