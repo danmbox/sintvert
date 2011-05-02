@@ -1,5 +1,5 @@
 SINTVERT
-A Jack wave-to-MIDI server for known waveforms
+A real-time wave-to-MIDI server for known waveforms
 
 Home page: http://danmbox.github.com/sintvert/
 Author: Dan A. Muresan (danmbox at gmail dot com)

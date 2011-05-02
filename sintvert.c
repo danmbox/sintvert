@@ -769,7 +769,7 @@ static void usage (const char *fmt, ...) {
     printf ("\n\n");
   }
   printf ("%s\n",
-   MYNAME " is a Jack wave-to-MIDI server for known waveforms"
+   MYNAME " is a real-time wave-to-MIDI server for known waveforms"
 NL ""
 NL "Usage: " MYNAME " -r RANGE -f FILE -d DELAY [OPTIONS]"
 NL "  or:  " MYNAME " { -h | --help | -? | --version }"
