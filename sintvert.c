@@ -537,9 +537,9 @@ static sample_t get_jsample () {
 static void *process_thread (void *arg) {
   (void) arg;
 
+  volatile jack_nframes_t lost_frames = 0, lost_midi = 0;
   for (;;) {
     int rc = -1;
-    jack_nframes_t lost_frames = 0, lost_midi = 0;
     int midicnt = 0;
 
     // BEGIN REAL-TIME SECTION
@@ -560,7 +560,7 @@ static void *process_thread (void *arg) {
     assert (rc == midicnt);
     for (int i = 0; i < midicnt; ++i) {
       jack_midi_data_t *evt = jack_midi_event_reserve (out, 0, 3);
-      if (evt == NULL) { ++lost_midi; break; }
+      if (evt == NULL) { lost_midi += midicnt - i; break; }
       char ch = midi_data [i];
       pack_midi_note_evt (evt, ch & ((1 << 7) - 1), (ch & (1 << 7)) != 0);
     }
@@ -591,15 +591,12 @@ static void *process_thread (void *arg) {
       // Log losses now if we can do it fast, else retry next time
       if (0 == pthread_mutex_trylock (&trace_buf->lock)) {
         pthread_cleanup_push (mutex_cleanup_routine, &trace_buf->lock);
-        if (lost_frames > srate / 50) {
-          TRACE (TRACE_WARN, "Lost frames %d", (int) lost_frames);
-          lost_frames = 0;
-        }
-        if (lost_midi > 0) {
-          TRACE (TRACE_WARN, "Los MIDI notes %d", (int) lost_midi);
-          lost_midi = 0;
-        }
+        if (lost_frames > srate / 50)
+          TRACE (TRACE_WARN, "Lost frames=%d", (int) lost_frames);
+        if (lost_midi > 0)
+          TRACE (TRACE_WARN, "Lost MIDI notes=%d", (int) lost_midi);
         pthread_cleanup_pop (1);
+        lost_frames = 0; lost_midi = 0;
       }
     }
   }
@@ -656,7 +653,9 @@ static void calibrate () {
 /// @return number of notes queued up (depends on available buffer space)
 static int queue_note (midi_note_t note, int on) {
   char ch = note + transpose_semitones; if (on) ch |= 1 << 7;
-  return jack_ringbuffer_write (jmidibuf, &ch, 1) == 1;
+  int rc = jack_ringbuffer_write (jmidibuf, &ch, 1) == 1;
+  if (rc == 0) TRACE (TRACE_WARN, "Lost MIDI note");
+  return rc;
 }
 
 /// Loops listening for audio, recognizing notes and queueing up MIDI.
