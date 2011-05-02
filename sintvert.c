@@ -190,7 +190,7 @@ jack_ringbuffer_t *jbuf = NULL,  ///< Incoming audio buffer
   *jmidibuf = NULL;  ///< Outgoing MIDI buffer
 /// Size of @c jbuf.
 /// Limited by jbufavail semaphore max.
-jack_nframes_t jbuf_len = 16384;
+jack_nframes_t jbuf_len = 16384, jmidibuf_len = 128;
 int jbufavail_semid;  ///< Counting semaphore for @c jbuf (in samples)
 int jbufavail_valid = 0;  ///< Is @c jbufavail_semid active?
 sem_t jmidibuf_sem;  ///< Counting semaphore for @c jmidibuf (in events)
@@ -536,10 +536,12 @@ static sample_t get_jsample () {
 static void *process_thread (void *arg) {
   (void) arg;
 
-  int rc;
-  jack_nframes_t lost_frames = 0;
-
   for (;;) {
+    int rc = -1;
+    jack_nframes_t lost_frames = 0, lost_midi = 0;
+    int midicnt = 0;
+
+    // BEGIN REAL-TIME SECTION
 
     jack_nframes_t nframes_orig = jack_cycle_wait (jclient),
       nframes = nframes_orig;
@@ -548,39 +550,55 @@ static void *process_thread (void *arg) {
       continue;
     }
 
+    // send queued up MIDI
     void *out = jack_port_get_buffer (jmidiport, nframes);
     jack_midi_clear_buffer (out);
-    while (0 == sem_trywait (&jmidibuf_sem)) {
-      char ch; jack_ringbuffer_read (jmidibuf, &ch, 1);
+    rc = sem_getvalue (&jmidibuf_sem, &midicnt); assert (rc == 0);
+    char midi_data [jmidibuf_len];
+    rc = jack_ringbuffer_read (jmidibuf, midi_data, midicnt);
+    assert (rc == midicnt);
+    for (int i = 0; i < midicnt; ++i) {
       jack_midi_data_t *evt = jack_midi_event_reserve (out, 0, 3);
-      if (evt == NULL) {
-        TRACE (TRACE_WARN, "MIDI note lost");
-        break;
-      }
+      if (evt == NULL) { ++lost_midi; break; }
+      char ch = midi_data [i];
       pack_midi_note_evt (evt, ch & ((1 << 7) - 1), (ch & (1 << 7)) != 0);
     }
 
+    // queue up incoming audio
     sample_t *in = jack_port_get_buffer (jport, nframes);
     if (-1 == (rc = semctl (jbufavail_semid, 0, GETVAL))) {
       TRACE_PERROR (TRACE_FATAL, "semctl");
-      break;
+      jack_cycle_signal (jclient, -1); break /* unreached */;
     }
-    jack_nframes_t avail = jbuf_len - rc - 2;
-    if (avail < 2 * nframes) nframes = (avail < 2) ? 0 : 2;
-    jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
+    if (nframes > jbuf_len - rc - 2) nframes = 0;
+    else
+      jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
+    lost_frames += nframes_orig - nframes;
 
     jack_cycle_signal (jclient, 0);
 
-    if (nframes > 0) {
+    // END REAL-TIME SECTION
+
+    if (nframes > 0) {  // inform audio consummer
       struct sembuf sops = { .sem_num = 0, .sem_op = nframes, .sem_flg = 0 };
       semop (jbufavail_semid, &sops, 1);
     }
-    lost_frames += nframes_orig - nframes;
-    if (lost_frames > srate / 50) {
+    for (int i = 0; i < midicnt; ++i) {  // subtract read MIDI notes
+      rc = sem_trywait (&jmidibuf_sem); assert (rc == 0);
+    }
+    if (lost_midi > 0 || lost_frames > (srate / 50 /* == 20 ms */)) {
+      // Log losses now if we can do it fast, else retry next time
       if (0 == pthread_mutex_trylock (&trace_buf->lock)) {
-        TRACE (TRACE_WARN, "Lost frames %d", (int) lost_frames);
-        lost_frames = 0;
-        pthread_mutex_unlock (&trace_buf->lock);
+        pthread_cleanup_push (mutex_cleanup_routine, &trace_buf->lock);
+        if (lost_frames > srate / 50) {
+          TRACE (TRACE_WARN, "Lost frames %d", (int) lost_frames);
+          lost_frames = 0;
+        }
+        if (lost_midi > 0) {
+          TRACE (TRACE_WARN, "Los MIDI notes %d", (int) lost_midi);
+          lost_midi = 0;
+        }
+        pthread_cleanup_pop (1);
       }
     }
   }
@@ -629,22 +647,26 @@ static void calibrate () {
          (janls.evt & (1 << ANL_EVT_SIL)) == 0);
 }
 
-static void queue_note (midi_note_t note, int on) {
+/// Queues up a note.
+/// If successful, must be matched with a @c sem_post to @c jmidibuf_sem.
+/// @return number of notes queued up (depends on available buffer space)
+static int queue_note (midi_note_t note, int on) {
   char ch = note + transpose_semitones; if (on) ch |= 1 << 7;
-  jack_ringbuffer_write (jmidibuf, &ch, 1);
+  return jack_ringbuffer_write (jmidibuf, &ch, 1) == 1;
 }
 
+/// Loops listening for audio, recognizing notes and queueing up MIDI.
 static void midi_server () {
-  midi_note_t cnote = 0;
+  midi_note_t cnote = MIDI_NOTE_NONE;
   gpt_seq_anl_state gpbs;
   gpt_seq_anl_state_init (&gpbs);
   TRACE (TRACE_IMPT, "MIDI server started, delay %lf", recog_ms);
   gpt_buf_len = 0;
   for (;;) {
     analyze_sample (get_jsample () * jnorm_factor, &janls);
-    if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != 0) {
-      queue_note (cnote, 0); sem_post (&jmidibuf_sem);
-      cnote = 0;
+    if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != MIDI_NOTE_NONE) {
+      if (queue_note (cnote, 0)) sem_post (&jmidibuf_sem);
+      cnote = MIDI_NOTE_NONE;
       gpt_seq_anl_state_init (&gpbs);
       TRACE (TRACE_INFO, "Note off");
       gpt_buf_len = 0;
@@ -664,12 +686,10 @@ static void midi_server () {
         while (gpt_buf_dur (1) > recog_frames)
           gpt_buf_shift ();
         midi_note_t note = gpt_seq_analyze (&gpbs);
-        if (note != MIDI_NOTE_NONE && note != cnote) {
-          int cut_last = cnote != 0;
-          queue_note (note, 1);
-          if (cut_last)
-            queue_note (cnote, 0);
-          sem_post (&jmidibuf_sem); if (cut_last) sem_post (&jmidibuf_sem);
+        if (note != MIDI_NOTE_NONE && note != cnote) {  // note change
+          int notes = queue_note (note, 1);
+          if (cnote != MIDI_NOTE_NONE) notes += queue_note (cnote, 0);
+          while (notes-- > 0) sem_post (&jmidibuf_sem);
 
           cnote = note;
           char scinote [4]; note_midi2sci (note, scinote);
@@ -716,7 +736,7 @@ static void setup_audio () {
   TRACE (TRACE_INFO, "Connected to jack, bufsize=%d, srate=%d",
              (int) jmaxbufsz, (int) srate);
   jbuf = jack_ringbuffer_create (jbuf_len * sizeof (sample_t)); ASSERT (jbuf != NULL);
-  jmidibuf = jack_ringbuffer_create (128); ASSERT (jmidibuf != NULL);
+  jmidibuf = jack_ringbuffer_create (jmidibuf_len); ASSERT (jmidibuf != NULL);
 
   sample_anl_state_init (&janls);
 
@@ -970,15 +990,24 @@ int main (int argc, char **argv) {
 
   Pipes have unpredictable max size and require slow syscalls.
 
-  pthread_mutex_trylock + keep an unannounced_data ringbuffer (per thread): mutex
-  may happen to be taken when queried until reader exhausts data, so local
+  pthread_mutex_trylock + keep an unannounced_data ringbuffer (per thread):
+  mutex may happen to be taken when queried until reader exhausts data, so local
   ringbuffer must be as large as global one. One extra level of data copying.
 
-  Unsynchronized "single-writer" paradigm issues: atomicity of pointers, cache
-  coherency, compiler / pipeline write reordering. In particular, both the
-  producer and the consummer read the other's pointer when checking for
-  available bytes / space. Under-estimations are no big deal but overestimations
-  can lead to bogus or lost data.
+  Unsynchronized (or "half-synced") "single-writer" buffer paradigm
+  issues: cache coherence, compiler / pipeline write / read
+  reordering, atomicity of pointers. The consumer thread "owns" the
+  read pointer, the producer thread owns the write pointer. Only
+  owners write their owned pointer, but both can read non-owned
+  pointers. Without full sync, a non-owned pointer can "appear" to
+  change before the pointed data is ready (due to cache non-coherence
+  and access reordering by compiler or hardware). E.g. the consumer
+  may "see" the write pointer move before its view of the pointed data
+  is up-to-date, leading to bogus data. Alternatively, the producer
+  may "see" the read pointer move before the consummer finishes
+  loading the pointed data; the producer will thus see the
+  still-in-use data as empty space and may overwrite it, leading to
+  lost frames.
 
 */
 
