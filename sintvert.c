@@ -57,6 +57,7 @@ const char *srcport = NULL, *dstport = NULL;
 // --- UTILS ---
 
 #define SQR( x ) ((x) * (x))
+#define ABS( x ) ((x) > 0 ? (x) : -(x))
 
 // Since sndfile doesn't have it...
 static sf_count_t my_sf_tell (SNDFILE *sndfile)
@@ -223,7 +224,7 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   if (s->peak != 0.0 && (border - x) * (border - s->peak) <= 0) {
     s->evt |= (1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO);
     s->npeaks++;
-    sample_t abs_peak = s->peak > 0 ? s->peak : -s->peak;
+    sample_t abs_peak = ABS (s->peak);
     if (s->peak > s->max_peak) {
       s->max_peak = abs_peak;
       s->max_peak_idx = s->npeaks - 1;
@@ -624,6 +625,7 @@ static void calibrate () {
 
   TRACE (TRACE_INT, "Found note");
   ASSERT (janls.npeaks == 0);
+  sample_t peak_at_old_idx = INFINITY;
   while (analyze_sample (get_jsample (), &janls),
          ((janls.evt & (1 << ANL_EVT_SIL)) == 0 &&
           janls.npeaks < stdmidi_npeaks))
@@ -631,15 +633,17 @@ static void calibrate () {
     if ((janls.evt & (1 << ANL_EVT_PEAK)) != 0)
       TRACE (TRACE_INT + 1, "Peak at frame %d %f",
              (int) janls.count, (float) janls.old_peak);
+    if (janls.npeaks == stdmidi_anls.max_peak_idx + 1)
+      peak_at_old_idx = ABS (janls.old_peak);
   }
-  if (janls.max_peak_idx != stdmidi_anls.max_peak_idx) {
-    TRACE (TRACE_FATAL, "calibration mismatch npeaks=%d %d %d %f %f",
-               janls.npeaks,
-               janls.max_peak_idx, stdmidi_anls.max_peak_idx,
-               janls.max_peak, stdmidi_anls.max_peak);
+  if (fabsf (janls.max_peak / peak_at_old_idx - 1) > 0.1) {
+    TRACE (TRACE_FATAL, "Mismatched waveform i=%d/%d (expected %d) peak=%f (vs. %f)",
+               janls.max_peak_idx, janls.npeaks, stdmidi_anls.max_peak_idx,
+               janls.max_peak, peak_at_old_idx);
     myshutdown (1);
   }
   jnorm_factor = stdmidi_anls.max_peak / janls.max_peak;
+  janls.noise_peak *= jnorm_factor;
   TRACE (TRACE_INFO, "Scaling factor against training file: %f", (float) jnorm_factor);
 
   // skip rest of note
