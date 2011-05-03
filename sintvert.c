@@ -84,6 +84,7 @@ typedef struct {
     noise_peak;  ///< Estimated noise level
   jack_nframes_t count,  ///< Frame counter
     voiced_ago,  ///< Frames since last sample above @c noise_peak
+    voiced_at,   ///< Frame count when voiced segment began or JACK_MAX_FRAMES
     peak_at;  ///< Frame count of @c old_peak
   int evt;  ///< Event flags OR-ed together, see @c sample_anl_event_bit
 } sample_anl_state;
@@ -92,7 +93,7 @@ typedef enum {
 } sample_anl_event_bit;
 void sample_anl_state_init (sample_anl_state *s) {
   memset (s, 0, sizeof (*s));
-  s->voiced_ago = JACK_MAX_FRAMES;
+  s->voiced_ago = s->voiced_at = JACK_MAX_FRAMES;
 }
 
 /// A feature point in the waveform (peak or zero crossing)
@@ -212,9 +213,10 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   if (absx > s->max_x)
     s->max_x = absx;
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
+    s->voiced_ago = 0;
+    if (s->voiced_at == JACK_MAX_FRAMES) s->voiced_at = s->count;
     if (s->voiced_ago >= wavebrk_sil_frames)
       s->evt |= (1 << ANL_EVT_ZERO);
-    s->voiced_ago = 0;
     if (absx > 5 * s->noise_peak && s->peak * (s->peak - x) <= 0) {
       s->peak = x;
       s->peak_at = s->count;
@@ -233,7 +235,10 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
     s->peak = 0.0;
   }
   ++s->voiced_ago;
-  if (s->voiced_ago == wavebrk_sil_frames) s->evt |= (1 << ANL_EVT_SIL);
+  if (s->voiced_ago == wavebrk_sil_frames) {
+    s->evt |= (1 << ANL_EVT_SIL);
+    s->voiced_at = JACK_MAX_FRAMES;
+  }
   ++s->count;
   s->x = x;
 }
@@ -661,10 +666,10 @@ static int queue_note (midi_note_t note, int on) {
 /// Loops listening for audio, recognizing notes and queueing up MIDI.
 static void midi_server () {
   midi_note_t cnote = MIDI_NOTE_NONE;
-  gpt_seq_anl_state gpbs;
-  gpt_seq_anl_state_init (&gpbs);
+  gpt_seq_anl_state gpbs; gpt_seq_anl_state_init (&gpbs);
   TRACE (TRACE_IMPT, "MIDI server started, delay %lf", recog_ms);
   gpt_buf_len = 0;
+
   for (;;) {
     analyze_sample (get_jsample () * jnorm_factor, &janls);
     if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != MIDI_NOTE_NONE) {
@@ -694,9 +699,12 @@ static void midi_server () {
           if (cnote != MIDI_NOTE_NONE) notes += queue_note (cnote, 0);
           while (notes-- > 0) sem_post (&jmidibuf_sem);
 
-          cnote = note;
           char scinote [4]; note_midi2sci (note, scinote);
-          TRACE (TRACE_INFO, "Note %s", scinote);
+          if (cnote == MIDI_NOTE_NONE)  // first note in a run
+            TRACE (TRACE_INFO, "Note %s (delay=%.1f ms)",
+                   scinote, ((float) (janls.count - janls.voiced_at) / srate * 1000.0));
+          else TRACE (TRACE_INFO, "Note %s", scinote);
+          cnote = note;
         }
       }
     }
