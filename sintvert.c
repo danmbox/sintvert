@@ -42,10 +42,11 @@ int note_scale [12] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 midi_note_t transpose_semitones = 0;
 midi_note_t lomidi = 0, himidi = 0;  ///< MIDI note range of our synth
 midi_note_t stdmidi = 60;  ///< MIDI note to calibrate against
-int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
 int velo_on = 100,  ///< MIDI velocity of note-on
   velo_off = 0;     ///< MIDI velocity of note-off
 int midi_chan = 0;  ///< MIDI channel to send notes on
+int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
+double after_peak_frac = 0.9;  ///< Fraction of last peak height to watch for
 int initial_sil_ms = 450;     ///< duration of segment for noise estimation
 double wavebrk_sil_ms = 1.5;  ///< msecs triggering silence detection
 double recog_ms = 12;         ///< min duration of a recognizable @c gpt_seq
@@ -86,7 +87,9 @@ typedef struct {
   jack_nframes_t count,  ///< Frame counter
     voiced_ago,  ///< Frames since last sample above @c noise_peak
     voiced_at,   ///< Frame count when voiced segment began or JACK_MAX_FRAMES
-    peak_at;  ///< Frame count of @c old_peak
+    peak_at,  ///< Frame count of @c old_peak
+    /// Frame count when amplitude first falls to @c after_peak_frac of old_peak
+    after_peak_at;
   int evt;  ///< Event flags OR-ed together, see @c sample_anl_event_bit
 } sample_anl_state;
 typedef enum {
@@ -221,7 +224,11 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
       s->evt |= (1 << ANL_EVT_ZERO);
     if (absx > 5 * s->noise_peak && s->peak * (s->peak - x) <= 0) {
       s->peak = x;
-      s->peak_at = s->count;
+      s->peak_at = s->after_peak_at = s->count;
+    } else {
+      if (s->after_peak_at == s->peak_at &&
+          (x / s->peak > 0) && (x / s->peak < after_peak_frac))
+        s->after_peak_at = s->count;
     }
   }
   sample_t border = (sample_t) copysign (s->noise_peak, s->peak);
@@ -451,7 +458,7 @@ static void load_waveform_db () {
 #define TEST( part, cond ) case part: if (! (cond)) continue; break
           switch (part) {
             TEST (0, (anls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
-                  gpt_buf_add (anls.old_peak, anls.peak_at) > INV_SEMITONE_RATIO);
+                  gpt_buf_add (anls.old_peak, anls.after_peak_at) > INV_SEMITONE_RATIO);
             TEST (1, (anls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
                   gpt_buf_add (0, anls.count) > INV_SEMITONE_RATIO);
           }
@@ -691,7 +698,7 @@ static void midi_server () {
 #define TEST( part, cond ) case part: if (! (cond)) continue; break
         switch (part) {
           TEST (0, (janls.evt & (1 << ANL_EVT_PEAK)) != 0 &&
-                gpt_buf_add (janls.old_peak, janls.peak_at) > 1);
+                gpt_buf_add (janls.old_peak, janls.after_peak_at) > 1);
           TEST (1, (janls.evt & (1 << ANL_EVT_ZERO)) != 0 &&
                 gpt_buf_add (0, janls.count) > 1);
         }
@@ -851,10 +858,12 @@ static void parse_args (char **argv) {
           usage ("Bad delay %s", *argv);
       } else if (0 == strcmp (*argv, "--train-max")) {
         sscanf (*++argv, "%lf", &train_max_ms);
+      } else if (0 == strcmp (*argv, "--aftpk-frac")) {
+        sscanf (*++argv, "%lf", &after_peak_frac);
       } else if (0 == strcmp (*argv, "--min-per")) {
         double f; sscanf (*++argv, "%lf", &f);
         if (f < 0.5) usage ("Bad minimum periods %lf", f);
-        gpt_seq_min_cnt = 0.1 + ceil (4 * f);
+        gpt_seq_min_cnt = 0.1 + round (4 * f);
       } else if (0 == strcmp (*argv, "-c") || 0 == strcmp (*argv, "--chan")) {
         sscanf (*++argv, "%d", &midi_chan);
         assert (midi_chan >= 0 && midi_chan < 128);
