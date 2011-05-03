@@ -48,7 +48,8 @@ int velo_on = 100,  ///< MIDI velocity of note-on
 int midi_chan = 0;  ///< MIDI channel to send notes on
 int initial_sil_ms = 450;     ///< duration of segment for noise estimation
 double wavebrk_sil_ms = 1.5;  ///< msecs triggering silence detection
-double recog_ms = 12;         ///< min duration of waveform to be recognized
+double recog_ms = 12;         ///< min duration of a recognizable @c gpt_seq
+size_t gpt_seq_min_cnt = 4;   ///< min # of points in a recognizable @c gpt_seq
 double train_max_ms = 250;    ///< how much to analyze from training waveforms
 /// File containing synth note sequence recording
 const char *dbfname = NULL;
@@ -101,10 +102,11 @@ typedef struct {
   sample_t x;  ///< Amplitude
   jack_nframes_t framecnt;  ///< Frame count
 } gridpt;
-/// Sequence type from @c gpt_seq_type
+/// Type of sequence as determined by @c gpt_seq_type
 typedef enum {
   GPT_SEQ_POSITIVE, GPT_SEQ_NEGATIVE, GPT_SEQ_FALLING0, GPT_SEQ_RISING0
 } gpt_seq_type_t;
+/// Sequence of feature points
 typedef struct {
   gridpt *seq;
   size_t length;  ///< Number of points
@@ -285,8 +287,11 @@ static void gpt_seq_add (midi_note_t note, gridpt *seq, size_t len) {
 
   ++gpt_seqdb_len;
 }
+/// Adds to @c gpt_seqdb new "recognizable" subsequences of @c gpt_buf.
+/// Only subsequences ending at @c gpt_buf_len are added (others have
+/// presumably been added in previous steps).
 static void gpt_seq_add_all (midi_note_t note, jack_nframes_t minframes) {
-  for (size_t i = 0; i < gpt_buf_len && gpt_buf_dur (i) >= minframes; ++i)
+  for (size_t i = 0; i < gpt_buf_len && gpt_buf_dur (i) >= minframes && gpt_buf_len - i >= gpt_seq_min_cnt; ++i)
     gpt_seq_add (note, &gpt_buf [i], gpt_buf_len - i);
 }
 
@@ -451,8 +456,9 @@ static void load_waveform_db () {
                   gpt_buf_add (0, anls.count) > INV_SEMITONE_RATIO);
           }
 #undef TEST
-          // when TEST succeeds a point was added AND completed a sequence:
-          while (gpt_buf_dur (0) > (recog_frames + note_period * srate / 4) * SEMITONE_RATIO)
+          // TEST succeeds if a point was added & seq duration reaches threshold
+          while (gpt_buf_len > gpt_seq_min_cnt &&
+                 gpt_buf_dur (0) > (recog_frames + note_period * srate / 4) * SEMITONE_RATIO)
             gpt_buf_shift ();
           gpt_seq_add_all (note, INV_SEMITONE_RATIO * recog_frames);
         }
@@ -690,9 +696,11 @@ static void midi_server () {
                 gpt_buf_add (0, janls.count) > 1);
         }
 #undef TEST
-        // when TEST succeeds a point was added AND completed a sequence:
-        while (gpt_buf_dur (1) > recog_frames)
+        // TEST succeeds if a point was added & seq duration reaches threshold
+        while (gpt_buf_len > gpt_seq_min_cnt &&
+               gpt_buf_dur (1) > recog_frames)
           gpt_buf_shift ();
+        if (gpt_buf_len < gpt_seq_min_cnt) continue;
         midi_note_t note = gpt_seq_analyze (&gpbs);
         if (note != MIDI_NOTE_NONE && note != cnote) {  // note change
           int notes = queue_note (note, 1);
@@ -787,6 +795,8 @@ NL "  -f, --db FILE      Notes recorded from synth for training"
 NL "  -r, --range RANGE  Range of notes in training file (e.g. F2-C5)"
 NL "  -p, --port JP      Jack audio port to listen on (e.g. system:capture_1)"
 NL "  -t, --midi-to JP   Jack MIDI port to output to"
+NL "  -d, --delay MSEC   Shortest duration of a recognizable waveform"
+NL "  --min-per PER      Minimum recognizable # of periods (>= 0.5, default 1)"
 NL "  --train-max MSEC   Truncate recorded notes to MSEC during training"
 NL "  --log-level N      Log level (defaults to 4, increase for details)"
 NL "  --velo V           MIDI note-on velocity (default 100)"
@@ -841,6 +851,10 @@ static void parse_args (char **argv) {
           usage ("Bad delay %s", *argv);
       } else if (0 == strcmp (*argv, "--train-max")) {
         sscanf (*++argv, "%lf", &train_max_ms);
+      } else if (0 == strcmp (*argv, "--min-per")) {
+        double f; sscanf (*++argv, "%lf", &f);
+        if (f < 0.5) usage ("Bad minimum periods %lf", f);
+        gpt_seq_min_cnt = 0.1 + ceil (4 * f);
       } else if (0 == strcmp (*argv, "-c") || 0 == strcmp (*argv, "--chan")) {
         sscanf (*++argv, "%d", &midi_chan);
         assert (midi_chan >= 0 && midi_chan < 128);
