@@ -40,12 +40,12 @@ static void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
     memfile_vprintf (trace_buf, fmt, ap);
     if (trace_print_fn) memfile_printf (trace_buf, " [%s]", fn);
     if (trace_print_tid)
-      memfile_printf (trace_buf, " [tid=0x%X]", (unsigned) pthread_self ());
+      memfile_printf (trace_buf, " [tid=0x%X]", (unsigned long) pthread_self ());
     memfile_printf (trace_buf, "\n");
     va_end (ap);
   } pthread_cleanup_pop (1);
 }
-void trace_flush () {
+static void trace_flush () {
   MUTEX_LOCK_WITH_CLEANUP (&trace_buf->switchlock); {
     memfile_switchbuf (trace_buf);
     fprintf (stdtrace, "%s", trace_buf->other);  // cancellation point
@@ -66,7 +66,7 @@ void trace_flush () {
   } while (0)
 #if 0  // enable as needed when debugging
 #include <execinfo.h>
-void print_backtrace () {
+static void print_backtrace () {
   void *array[30];
   size_t size = backtrace (array, 30);
   char **strings = backtrace_symbols (array, size);
