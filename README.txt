@@ -25,7 +25,7 @@ killed.
 
 * jack, sndfile
 
-* build dependencies: GNU make
+* build dependencies: GNU make, pkg-config, help2man
 
 
 3. INSTALLING:

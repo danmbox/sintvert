@@ -1,7 +1,5 @@
 ### User configurable section
 
-CFLAGS     +=
-
 prefix      = /usr/local
 
 exec_prefix = $(prefix)
@@ -16,11 +14,16 @@ INSTALL         = install
 INSTALL_PROGRAM = $(INSTALL)
 INSTALL_DATA    = $(INSTALL) -m 644
 
+CFLAGS +=
+
 DESTDIR =
 
 ### End user configurable section
 
-CFLAGS += -Os -g -Wall -Wextra -pipe
+EXTPKG   := jack sndfile  # extern package dependencies
+
+CFLAGS   += -Os -g -Wall -Wextra -pipe $(shell pkg-config --cflags $(EXTPKG))
+LDFLAGS  += $(shell pkg-config --libs $(EXTPKG))
 
 TMP_WILD := $(TMP_WILD) *~ *.bak cscope.*
 TMP_PAT  := $(subst *,%,$(TMP_WILD))
@@ -40,7 +43,7 @@ CLEAN_FILES := $(MANS) $(PROGS)
 all: $(PROGS) $(MANS)
 
 sintvert: sintvert.c $(wildcard *.h) Makefile
-	$(CC) $(CFLAGS) -std=c99 -D_REENTRANT -ljack -lsndfile -lm  -lpthread -lrt $< -o $@
+	$(CC) $(CFLAGS) -std=c99 -D_REENTRANT $(LDFLAGS) -lm -lpthread -lrt $< -o $@
 
 man/%.1: % $(filter-out $(wildcard man), man) Makefile
 	help2man -N -o $@ $(abspath $<) || { $< --help || :; $< --version || :; false; }
