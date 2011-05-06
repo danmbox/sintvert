@@ -1,5 +1,9 @@
-DESTDIR     =
+### User configurable section
+
+CFLAGS     +=
+
 prefix      = /usr/local
+
 exec_prefix = $(prefix)
 bindir      = $(exec_prefix)/bin
 sbindir     = $(exec_prefix)/sbin
@@ -12,15 +16,18 @@ INSTALL         = install
 INSTALL_PROGRAM = $(INSTALL)
 INSTALL_DATA    = $(INSTALL) -m 644
 
-###
+DESTDIR =
+
+### End user configurable section
 
 CFLAGS += -Os -g -Wall -Wextra -pipe
 
 TMP_WILD := $(TMP_WILD) *~ *.bak cscope.*
 TMP_PAT  := $(subst *,%,$(TMP_WILD))
+
 RELEASE  := $(shell cat release.txt)
 MYNAME   := sintvert
-DISTNAME  := $(MYNAME)-$(RELEASE)
+DISTNAME := $(MYNAME)-$(RELEASE)
 
 PROGS := sintvert
 MANS := $(addprefix man/, $(PROGS:=.1))
@@ -32,7 +39,7 @@ CLEAN_FILES := $(MANS) $(PROGS)
 
 all: $(PROGS) $(MANS)
 
-sintvert: sintvert.c Makefile
+sintvert: sintvert.c $(wildcard *.h) Makefile
 	$(CC) $(CFLAGS) -std=c99 -D_REENTRANT -ljack -lsndfile -lm  -lpthread -lrt $< -o $@
 
 man/%.1: % $(filter-out $(wildcard man), man) Makefile
@@ -48,11 +55,8 @@ clean:
 	rm -rf $(CLEAN_FILES)
 
 srcdist: clean
-	TD=`mktemp -d /tmp/mkdist.XXXXXX`; \
-	cp -a . $$TD/$(DISTNAME); cd $$TD; \
-	find $(DISTNAME) '(' -name '.git' -prune ')' -o -type f -print | \
-	  tar -cvzf /tmp/$(DISTNAME).tar.gz -T -; \
-	test $$TD && $(RM) -r $$TD/*; rmdir $$TD
+	git archive --format=tar --prefix=$(DISTNAME)/ HEAD | \
+	  gzip -c >/tmp/$(DISTNAME).tar.gz
 
 showvars:
 	@echo TMP_PAT: $(TMP_PAT)
