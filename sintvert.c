@@ -55,6 +55,7 @@ double train_max_ms = 250;    ///< how much to analyze from training waveforms
 /// File containing synth note sequence recording
 const char *dbfname = NULL;
 const char *srcport = NULL, *dstport = NULL;
+int afterlife = 0;  ///< don't quit after Jack kills us
 
 // --- UTILS ---
 
@@ -192,6 +193,7 @@ jack_nframes_t initial_sil_frames = 0,
 jack_nframes_t srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
 sem_t zombified;
+int cleaned_up = 0;
 jack_port_t *jport = NULL, *jmidiport = NULL;
 jack_ringbuffer_t *jbuf = NULL,  ///< Incoming audio buffer
   *jmidibuf = NULL;  ///< Outgoing MIDI buffer
@@ -532,7 +534,8 @@ static sample_t get_jsample () {
         TRACE_PERROR (TRACE_FATAL, "semop");
         myshutdown (1);
       }
-    if (0 == sem_trywait (&zombified)) myshutdown (1);
+    int z;
+    if (0 == sem_getvalue (&zombified, &z) && z > 0) myshutdown (1);
 
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
@@ -729,12 +732,14 @@ static void midi_server () {
 static void on_jack_shutdown (void *arg) {
   (void) arg;
 
-  sem_post (&zombified);
-  // Wake up get_jsample(). It will test zombified and realize there's no
-  // extra sample.
-  struct sembuf sops = { .sem_num = 0, .sem_op = 1, .sem_flg = 0 };
-  semop (jbufavail_semid, &sops, 1);
-  TRACE (TRACE_FATAL, "Jack shut us down");
+  int z = 0;
+  if (0 == sem_getvalue (&zombified, &z) && z == 0) {
+    sem_post (&zombified);
+    // Wake up get_jsample(). It will test zombified and realize there's no
+    // extra sample.
+    struct sembuf sops = { .sem_num = 0, .sem_op = 1, .sem_flg = 0 };
+    semop (jbufavail_semid, &sops, 1);
+  }
 }
 
 static void setup_audio () {
@@ -746,7 +751,7 @@ static void setup_audio () {
   semctl_arg_t semarg = { .val = 0 };
   ENSURE_SYSCALL (semctl, (jbufavail_semid, 0, SETVAL, semarg));
 
-  jack_options_t jopt = 0;  // JackNoStartServer;
+  jack_options_t jopt = JackNullOption;  // JackNoStartServer;
   jack_status_t jstat;
   ENSURE_CALL_AND_SAVE (jack_client_open, (MYNAME, jopt, &jstat), jclient, NULL);
   jack_on_shutdown (jclient, on_jack_shutdown, NULL);
@@ -805,12 +810,13 @@ NL "  -t, --midi-to JP   Jack MIDI port to output to"
 NL "  -d, --delay MSEC   Shortest duration of a recognizable waveform"
 NL "  --min-per PER      Minimum recognizable # of periods (>= 0.5, default 1)"
 NL "  --train-max MSEC   Truncate recorded notes to MSEC during training"
-NL "  --log-level N      Log level (defaults to 4, increase for details)"
 NL "  --velo V           MIDI note-on velocity (default 100)"
 NL "  --velo-off Voff    MIDI note-off velocity (default 0)"
 NL "  -c, --chan C       MIDI channel number"
 NL "  --transpose SEMIT  Semitones to transpose (e.g. -12)"
 NL "  --scale S          Scale restriction (e.g. C#min, EbMaj)"
+NL "  --log-level N      Log level (defaults to 4, increase for details)"
+NL "  --zombify          Don't exit if jack kills us (wait for interrupt)"
 NL ""
 NL MYNAME " needs a mono recording containing all the notes of the chromatic"
 NL "scale in the given --range, with short pauses in between. After loading this"
@@ -889,6 +895,8 @@ static void parse_args (char **argv) {
         trace_print_tid = 1;
       } else if (0 == strcmp (*argv, "--log-fun")) {
         trace_print_fn = 1;
+      } else if (0 == strcmp (*argv, "--zombify")) {
+        afterlife = 1;
       } else {
         usage ("unknown option %s", *argv);
       }
@@ -932,12 +940,15 @@ static void init_trace () {
 }
 
 static void cleanup () {
+  int z = 0;
+  if (0 == sem_getvalue (&zombified, &z) && z > 0)
+    TRACE (TRACE_FATAL, "Jack shut us down");
   if (poll_thread_started) {
     pthread_cancel (poll_thread_tid);
     pthread_join (poll_thread_tid, NULL);
   }
   if (jclient != NULL) {
-    jack_on_shutdown (jclient, NULL, NULL);
+    if (z == 0) sem_post (&zombified);  // main already knows about it
     jack_client_close (jclient);
     jclient = NULL;
   }
@@ -945,19 +956,26 @@ static void cleanup () {
     jbufavail_valid = 0;
     semctl (jbufavail_semid, 0, IPC_RMID);
   }
+
   TRACE (TRACE_INFO, "Cleanup finished");
   trace_flush ();
+  cleaned_up = 1;
 }
 
 // pitfall: name clash with shutdown(2)
 static void myshutdown (int failure) {
   TRACE (TRACE_INFO, "shutdown requested");
   // print_backtrace ();
+  pthread_sigmask (SIG_BLOCK, &sigmask, NULL);
   cleanup ();
+  pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
+  if (afterlife) pause ();
   exit (failure ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 static void sig_handler (int sig) {
+  // We are in the main thread -- all other threads block signals
+  if (sig == SIGPIPE) return;  // we don't do pipes
   TRACE (TRACE_INFO, "Caught signal %d", sig);
   cleanup ();
   struct sigaction act =
