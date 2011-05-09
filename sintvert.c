@@ -59,9 +59,6 @@ int afterlife = 0;  ///< don't quit after Jack kills us
 
 // --- UTILS ---
 
-#define SQR( x ) ((x) * (x))
-#define ABS( x ) ((x) > 0 ? (x) : -(x))
-
 // Since sndfile doesn't have it...
 static sf_count_t my_sf_tell (SNDFILE *sndfile)
 { return sf_seek (sndfile, 0, SEEK_CUR); }

@@ -6,6 +6,10 @@
 
 #include <pthread.h>
 
+#define SQR( x ) ((x) * (x))
+#define ABS( x ) ((x) > 0 ? (x) : -(x))
+#define MAX( x, y )  ((x) > (y) ? (x) : (y))
+
 static void mutex_cleanup_routine (void *lock_) {
   pthread_mutex_unlock ((pthread_mutex_t *) lock_);
 }
