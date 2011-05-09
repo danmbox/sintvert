@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <limits.h>
 #include <string.h>
+#include <strings.h>
 #include <math.h>
 #include <assert.h>
 
@@ -55,6 +56,7 @@ double train_max_ms = 250;    ///< how much to analyze from training waveforms
 /// File containing synth note sequence recording
 const char *dbfname = NULL;
 const char *srcport = NULL, *dstport = NULL;
+const char *rec_fname = NULL;
 int afterlife = 0;  ///< don't quit after Jack kills us
 
 // --- UTILS ---
@@ -517,6 +519,7 @@ static void load_waveform_db () {
   }
   TRACE (TRACE_INFO, "%d sequences loaded from training file", gpt_seqdb_len);
 
+  sf_close (dbf);
   return;
 
 premature:
@@ -525,11 +528,30 @@ premature:
   myshutdown (1);
 }
 
+static SNDFILE *recording = NULL;
+void open_recording () {
+  if (rec_fname != NULL && recording == NULL) {
+    const char *dot = strrchr (rec_fname, '.');
+    TRACE_ASSERT (dot != NULL, myshutdown (1));
+    SF_INFO sf_info; memset (&sf_info, 0, sizeof (sf_info));
+    if (0 == strcasecmp (dot, ".flac"))
+      sf_info.format = SF_FORMAT_FLAC;
+    else if (0 == strcasecmp (dot, ".wav"))
+      sf_info.format = SF_FORMAT_WAV;
+    else
+      TRACE_ASSERT (! "format != FLAC or WAV", myshutdown (1));
+    sf_info.format |= SF_FORMAT_PCM_24;
+    sf_info.channels = 1; sf_info.samplerate = srate;
+    ENSURE_CALL_AND_SAVE (sf_open, (rec_fname, SFM_WRITE, &sf_info), recording, NULL);
+  }
+}
 static sample_t get_jsample () {
   static jack_nframes_t jdatalen = 0;
   static sample_t *jdataptr = NULL,  ///< Beginning of current data in @c jbuf
     *jdataend = NULL;  ///< End of current data in @c jbuf
   int rc;
+
+  open_recording ();
 
   if (jdataptr == jdataend) {
     jack_ringbuffer_read_advance (jbuf, jdatalen * sizeof (sample_t));
@@ -557,6 +579,8 @@ static sample_t get_jsample () {
     semop (jbufavail_semid, &sops, 1);
     jdataptr = (sample_t *) jdatainfo [0].buf;
     jdataend = jdataptr + jdatalen;
+    if (recording != NULL)
+      ENSURE_CALL (sf_write_float, (recording, jdataptr, jdatalen) != jdatalen);
   }
   return *jdataptr++;
 }
@@ -822,6 +846,7 @@ NL "  -c, --chan C       MIDI channel number"
 NL "  --transpose SEMIT  Semitones to transpose (e.g. -12)"
 NL "  --scale S          Scale restriction (e.g. C#min, EbMaj)"
 NL "  --log-level N      Log level (defaults to 4, increase for details)"
+NL "  --record RECFILE   Record input to RECFILE (WAV or FLAC extension)"
 NL "  --zombify          Don't exit if jack kills us (wait for interrupt)"
 NL ""
 NL MYNAME " needs a mono recording containing all the notes of the chromatic"
@@ -903,6 +928,8 @@ static void parse_args (char **argv) {
         trace_print_fn = 1;
       } else if (0 == strcmp (*argv, "--zombify")) {
         afterlife = 1;
+      } else if (0 == strcmp (*argv, "--record")) {
+        rec_fname = *++argv;
       } else {
         usage ("unknown option %s", *argv);
       }
@@ -962,6 +989,7 @@ static void cleanup () {
     jbufavail_valid = 0;
     semctl (jbufavail_semid, 0, IPC_RMID);
   }
+  if (recording != NULL) sf_close (recording);
 
   TRACE (TRACE_INFO, "Cleanup finished");
   trace_flush ();
