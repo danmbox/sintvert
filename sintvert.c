@@ -498,6 +498,15 @@ static void load_waveform_db () {
     }
   }
 
+  while (sf_read_double (dbf, &x, 1) == 1) {  // skip silence
+    analyze_sample (x, &anls);
+    if (anls.voiced_ago <= 1) {
+      TRACE (TRACE_WARN, "Extra notes at end of training file at frame=%ld",
+             (long) my_sf_tell (dbf));
+      break;
+    }
+  }
+
   qsort (gpt_seqdb, gpt_seqdb_len, sizeof (gpt_seqdb [0]),
          (int (*) (const void *, const void *)) gpt_seq_cmp);
 
