@@ -47,8 +47,10 @@ int velo_on = 100,  ///< MIDI velocity of note-on
   velo_off = 0;     ///< MIDI velocity of note-off
 int midi_chan = 0;  ///< MIDI channel to send notes on
 int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
+float noise_sigmas = 8;  ///< # of standard deviations for noise threshold
+int noise_range_use_max = 0;  ///< Use observed noise range for estimation?
 double after_peak_frac = 0.9;  ///< Fraction of last peak height to watch for
-int initial_sil_ms = 450;     ///< duration of segment for noise estimation
+int initial_sil_ms = 1000;    ///< duration of segment for noise estimation
 double wavebrk_sil_ms = 1.5;  ///< msecs triggering silence detection
 double recog_ms = 12;         ///< min duration of a recognizable @c gpt_seq
 size_t gpt_seq_min_cnt = 4;   ///< min # of points in a recognizable @c gpt_seq
@@ -79,11 +81,17 @@ typedef struct {
   int npeaks,  ///< Total number of peaks
     max_peak_idx;  ///< Index of @c max_peak (among all peaks)
   sample_t x,  ///< Latest sample analyzed
+    dc,  ///< DC offset to be removed (fixed)
+    norm_factor,  ///< normalization multiplier (fixed)
+    sigma,  ///< standard deviation (fixed)
     peak,  ///< Current peak candidate
     old_peak,  ///< Latest confirmed peak
-    max_x,  ///< Largest absolute value ever
+    max_x,  ///< Maximum (positive) value ever
+    min_x,  ///< Minimum (negative) value ever
     max_peak,  ///< Largest peak
     noise_peak;  ///< Estimated noise level
+  long double sum,   ///< running sum of samples
+    sum2;  ///< running sum of squares of samples
   jack_nframes_t count,  ///< Frame counter
     voiced_ago,  ///< Frames since last sample above @c noise_peak
     voiced_at,   ///< Frame count when voiced segment began or JACK_MAX_FRAMES
@@ -97,7 +105,26 @@ typedef enum {
 } sample_anl_event_bit;
 void sample_anl_state_init (sample_anl_state *s) {
   memset (s, 0, sizeof (*s));
+  s->max_x = -INFINITY; s->min_x = INFINITY;
+  s->dc = 0; s->norm_factor = 1;
   s->voiced_ago = s->voiced_at = JACK_MAX_FRAMES;
+  s->sum = 0;
+}
+/// Computes the @c dc offset, removes it from statistics.
+void sample_anl_state_unbias (sample_anl_state *s) {
+  TRACE (TRACE_DIAG, "min=%f max=%f sum=%f sum2=%f n=%d",
+         s->min_x, s->max_x, (float) s->sum, (float) s->sum2, (int) s->count);
+  s->dc = s->sum / s->count;
+  s->sigma = sqrtf ((s->sum2 - SQR (s->sum) / s->count) / (s->count - 1));
+  s->sum = 0; s->sum2 = 0;
+  s->max_x -= s->dc; s->min_x -= s->dc;
+  // TODO: reset unadjustable statistics
+}
+/// Sets the @c norm_factor, normalizes statistics.
+void sample_anl_state_norm (sample_anl_state *s, sample_t norm_factor_) {
+  s->norm_factor = norm_factor_;
+  s->max_x *= norm_factor_; s->min_x *= norm_factor_;
+  s->noise_peak *= norm_factor_; s->sigma *= norm_factor_;
 }
 
 /// A feature point in the waveform (peak or zero crossing)
@@ -204,7 +231,6 @@ int jbufavail_valid = 0;  ///< Is @c jbufavail_semid active?
 sem_t jmidibuf_sem;  ///< Counting semaphore for @c jmidibuf (in events)
 sample_t norm_noise_peak = 0;  ///< Estimated noise amplitude in training file
 sample_anl_state stdmidi_anls;  ///< State for calibration note analyzer
-sample_t jnorm_factor = 0.0;  ///< Multiplier against training file loudness
 sample_anl_state janls;  ///< Analyzer state for jack samples
 gridpt *gpt_buf = NULL;  ///< Buffer of current feature points
 size_t gpt_buf_max = 0,  ///< Maximum for @c gpt_buf_len
@@ -214,10 +240,12 @@ size_t gpt_seqdb_max = 20000 /* grows */,
   gpt_seqdb_len = 0;  ///< Current size of @c gpt_seqdb
 
 void analyze_sample (sample_t x, sample_anl_state * const s) {
+  x -= s->dc; x *= s->norm_factor;
+  s->sum += x; s->sum2 += SQR (x);
   s->evt = 0;
   sample_t absx = fabsf (x);
-  if (absx > s->max_x)
-    s->max_x = absx;
+  if (x > s->max_x) s->max_x = x;
+  if (x < s->min_x) s->min_x = x;
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
     s->voiced_ago = 0;
     if (s->voiced_at == JACK_MAX_FRAMES) s->voiced_at = s->count;
@@ -433,8 +461,12 @@ static void load_waveform_db () {
     if (sf_read_double (dbf, &x, 1) < 1) goto premature;
     analyze_sample (x, &anls);
   }
-  norm_noise_peak = anls.noise_peak = 4 * anls.max_x;
-  TRACE (TRACE_DIAG, "Noise peak in db file: %.5f", (float) norm_noise_peak);
+  sample_anl_state_unbias (&anls);
+  norm_noise_peak = anls.noise_peak = noise_range_use_max ?
+    1.1 * (anls.max_x - anls.min_x) :
+    noise_sigmas * anls.sigma;
+  TRACE (TRACE_DIAG, "Noise peak in db file: %.5f, DC=%.5f",
+         (float) norm_noise_peak, (float) anls.dc);
 
   for (midi_note_t note = lomidi; note <= himidi; ++note) {
     double note_period = 1 / note_midi2freq (note);
@@ -517,7 +549,7 @@ static void load_waveform_db () {
     TRACE (TRACE_INT, "seq i=%d %s", i, buf);
     if (i % 10 == 0) trace_flush ();
   }
-  TRACE (TRACE_INFO, "%d sequences loaded from training file", gpt_seqdb_len);
+  TRACE (TRACE_INFO, "%d sequences loaded from training file", (int) gpt_seqdb_len);
 
   sf_close (dbf);
   return;
@@ -657,14 +689,18 @@ static void *process_thread (void *arg) {
 
 /// Calibrates the live signal against the waveform database.
 static void calibrate () {
-  sample_t noise_peak;
-
   // find noise level
   TRACE (TRACE_DIAG, "Analysing noise...");
+  if (0 == jack_port_connected (jport))
+    TRACE (TRACE_IMPT, "Please connect " MYNAME "'s audio input port");
   for (jack_nframes_t i = 0; i < initial_sil_frames; ++i)
     analyze_sample (get_jsample (), &janls);
-  noise_peak = janls.noise_peak = 4 * janls.max_x;
-  TRACE (TRACE_DIAG, "Noise peak in input: %.5f", (float) noise_peak);
+  sample_anl_state_unbias (&janls);
+  janls.noise_peak = noise_range_use_max ?
+    1.1 * (janls.max_x - janls.min_x) :
+    noise_sigmas * janls.sigma;
+  TRACE (TRACE_DIAG, "Noise peak in input: %.5f, DC=%.5f",
+         (float) janls.noise_peak, (float) janls.dc);
 
   // skip silence
   char stdscinote [4]; note_midi2sci (stdmidi, stdscinote);
@@ -690,9 +726,8 @@ static void calibrate () {
                janls.max_peak, peak_at_old_idx);
     myshutdown (1);
   }
-  jnorm_factor = stdmidi_anls.max_peak / janls.max_peak;
-  janls.noise_peak *= jnorm_factor;
-  TRACE (TRACE_INFO, "Scaling factor against training file: %f", (float) jnorm_factor);
+  sample_anl_state_norm (&janls, stdmidi_anls.max_peak / janls.max_peak);
+  TRACE (TRACE_INFO, "Scaling factor against training file: %f", (float) janls.norm_factor);
 
   // skip rest of note
   while (analyze_sample (get_jsample (), &janls),
@@ -717,7 +752,7 @@ static void midi_server () {
   gpt_buf_len = 0;
 
   for (;;) {
-    analyze_sample (get_jsample () * jnorm_factor, &janls);
+    analyze_sample (get_jsample (), &janls);
     if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != MIDI_NOTE_NONE) {
       if (queue_note (cnote, 0)) sem_post (&jmidibuf_sem);
       cnote = MIDI_NOTE_NONE;
@@ -840,6 +875,8 @@ NL "  -t, --midi-to JP   Jack MIDI port to output to"
 NL "  -d, --delay MSEC   Shortest duration of a recognizable waveform"
 NL "  --min-per PER      Minimum recognizable # of periods (>= 0.5, default 1)"
 NL "  --train-max MSEC   Truncate recorded notes to MSEC during training"
+NL "  --noise-range S   Noise threshold (in standard deviations, default 8);"
+NL "                     use 'max' for actual observed range"
 NL "  --velo V           MIDI note-on velocity (default 100)"
 NL "  --velo-off Voff    MIDI note-off velocity (default 0)"
 NL "  -c, --chan C       MIDI channel number"
@@ -901,6 +938,13 @@ static void parse_args (char **argv) {
         double f; sscanf (*++argv, "%lf", &f);
         if (f < 0.5) usage ("Bad minimum periods %lf", f);
         gpt_seq_min_cnt = 0.1 + round (4 * f);
+      } else if (0 == strcmp (*argv, "--noise-range")) {
+        if (sscanf (*++argv, "%f", &noise_sigmas) < 1) {
+          if (0 == strcmp (*argv, "max"))
+            noise_range_use_max = 1;
+          else
+            usage ("Bad noise range %s", *argv);
+        }
       } else if (0 == strcmp (*argv, "-c") || 0 == strcmp (*argv, "--chan")) {
         sscanf (*++argv, "%d", &midi_chan);
         assert (midi_chan >= 0 && midi_chan < 128);

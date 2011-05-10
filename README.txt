@@ -8,10 +8,11 @@ Author: Dan A. Muresan (danmbox at gmail dot com)
 1. DESCRIPTION:
 
 sintvert needs a mono recording containing all the notes of the
-chromatic scale to be recognized, with short pauses in between. Create
-this file by recording output from your keyboard or synthesizer. Try
-to pick a "clean" patch, i.e. one which has no echo (there is no sound
-after you release a key) and which looks as close as possible to a
+chromatic scale to be recognized, with short pauses in between and
+with a few seconds of silence at the beginning. Create this file by
+recording output from your keyboard or synthesizer. Try to pick a
+"clean" patch, i.e. one which has no echo (there is no sound after you
+release a key), little LFO, and which looks as close as possible to a
 sine wave.
 
 After loading this training file, the program expects you to press the
