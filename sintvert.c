@@ -157,7 +157,7 @@ int gpt_seq_cmp (const gpt_seq *s1, const gpt_seq *s2) {
 // C assert also works (though not as nicely).
 static void myshutdown (int failure);
 
-#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (1));
+#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (2));
 #define ENSURE_SYSCALL( syscall, args )                          \
   do {                                                           \
     if (-1 == (syscall args)) {                                   \
@@ -967,7 +967,10 @@ static void myshutdown (int failure) {
   cleanup ();
   pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
   if (afterlife) pause ();
-  exit (failure ? EXIT_FAILURE : EXIT_SUCCESS);
+  switch (failure) {
+  case 0: case 1: exit (failure ? EXIT_FAILURE : EXIT_SUCCESS);
+  case 2: abort ();
+  }
 }
 
 static void sig_handler (int sig) {
