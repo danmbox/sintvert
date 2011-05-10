@@ -18,7 +18,12 @@ static trace_pri_t trace_level = TRACE_INFO;
 static int trace_print_tid = 0, trace_print_fn = 0;
 static memfile *trace_buf = NULL;
 static FILE *stdtrace = NULL;
-static void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...) {
+
+#if __GNUC__ >= 4
+__attribute__ ((format (printf, 3, 4)))
+#endif
+static void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...)
+{
   if (pri > trace_level) return;
   struct timeval tv;
   char timestr [80];
