@@ -62,7 +62,9 @@ srcdist: clean
 	  gzip -c >/tmp/$(DISTNAME).tar.gz
 
 showvars:
-	@echo TMP_PAT: $(TMP_PAT)
+	@echo "TMP_PAT := " $(TMP_PAT)
+	@echo "CFLAGS  := " $(CFLAGS)
+	@echo "LDFLAGS := " $(LDFLAGS)
 
 man:
 	mkdir man
