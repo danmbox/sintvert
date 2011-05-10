@@ -63,6 +63,44 @@ int afterlife = 0;  ///< don't quit after Jack kills us
 
 // --- UTILS ---
 
+/// Sends @c SIGABRT to the process, then loops forever.
+/// This function is necessary because plain @c abort() unblocks SIGABRT,
+/// making it impossible to guarantee signal delivery to a specific thread.
+static void myabort () {
+  kill (getpid (), SIGABRT);
+  for (;;) pause ();
+}
+
+#define ASSERT( cond ) TRACE_ASSERT (cond, myabort ());
+
+#define ENSURE_SYSCALL( syscall, args )                           \
+  do {                                                            \
+    if (-1 == (syscall args)) {                                   \
+      TRACE_PERROR (TRACE_FATAL, #syscall); myabort ();           \
+    }                                                             \
+  } while (0)
+#define ENSURE_SYSCALL_AND_SAVE( syscall, args, rc )              \
+  do {                                                            \
+    if (-1 == (rc = (syscall args))) {                            \
+      TRACE_PERROR (TRACE_FATAL, #syscall); myabort ();            \
+    }                                                             \
+  } while (0)
+// E.g. ENSURE_CALL (myfun, (arg1, arg2) != 0)
+#define ENSURE_CALL( call, args)                                        \
+  do {                                                                  \
+    if (call args) {                                                    \
+      TRACE (TRACE_FATAL, #call " failed (%s:%d)", __FILE__, __LINE__); \
+      myabort ();                                                       \
+    }                                                                   \
+  } while (0)
+#define ENSURE_CALL_AND_SAVE( call, args, rc, bad )                     \
+  do {                                                                  \
+    if (bad == (rc = (call args))) {                                    \
+      TRACE (TRACE_FATAL, #call " failed (%s:%d)", __FILE__, __LINE__); \
+      abort ();                                                         \
+    }                                                                   \
+  } while (0)
+
 // Since sndfile doesn't have it...
 static sf_count_t my_sf_tell (SNDFILE *sndfile)
 { return sf_seek (sndfile, 0, SEEK_CUR); }
@@ -182,36 +220,12 @@ int gpt_seq_cmp (const gpt_seq *s1, const gpt_seq *s2) {
 
 // --- PROGRAM ---
 
-// ASSERT to be used from main thread and not for general-purpose routines.
-// C assert also works (though not as nicely).
 static void myshutdown (int failure);
-
-#define ASSERT( cond ) TRACE_ASSERT (cond, myshutdown (2));
-#define ENSURE_SYSCALL( syscall, args )                          \
-  do {                                                           \
-    if (-1 == (syscall args)) {                                   \
-      TRACE_PERROR (TRACE_FATAL, #syscall); myshutdown (1);      \
-    }                                                            \
-  } while (0)
-// E.g. ENSURE_CALL (myfun, (arg1, arg2) != 0)
-#define ENSURE_CALL( call, args)                                        \
-  do {                                                                  \
-    if (call args) {                                                    \
-      TRACE (TRACE_FATAL, #call " failed (%s:%d)", __FILE__, __LINE__); \
-      myshutdown (1);                                                   \
-    }                                                                   \
-  } while (0)
-#define ENSURE_CALL_AND_SAVE( call, args, rc, bad )                     \
-  do {                                                                  \
-    if (bad == (rc = (call args))) {                                    \
-      TRACE (TRACE_FATAL, #call " failed (%s:%d)", __FILE__, __LINE__); \
-      myshutdown (1);                                                   \
-    }                                                                   \
-  } while (0)
 
 // internal vars
 sigset_t sigmask;
 pthread_t poll_thread_tid = 0; int poll_thread_started = 0;
+pthread_t main_tid = 0;
 jack_nframes_t initial_sil_frames = 0,
   wavebrk_sil_frames = 0,
   recog_frames = 0,
@@ -226,8 +240,10 @@ jack_ringbuffer_t *jbuf = NULL,  ///< Incoming audio buffer
 /// Size of @c jbuf.
 /// Limited by jbufavail semaphore max.
 jack_nframes_t jbuf_len = 16384, jmidibuf_len = 128;
-int jbufavail_semid;  ///< Counting semaphore for @c jbuf (in samples)
-int jbufavail_valid = 0;  ///< Is @c jbufavail_semid active?
+/// Counting semaphore for @c jbuf (in frames).
+/// May underestimate occupancy by one (see @c get_jsample() implementation).
+int jbufavail_semid;
+int jbufavail_valid = 0;  ///< Is @c jbufavail_semid allocated?
 sem_t jmidibuf_sem;  ///< Counting semaphore for @c jmidibuf (in events)
 sample_t norm_noise_peak = 0;  ///< Estimated noise amplitude in training file
 sample_anl_state stdmidi_anls;  ///< State for calibration note analyzer
@@ -343,7 +359,7 @@ static int gpt_seq_search (const gpt_seq *gseq,
                            size_t beg, size_t end, size_t *mid)
 {
   int rc = INT_MAX;
-  assert (beg < end);
+  ASSERT (beg < end);
   while (beg < end) {
     *mid = (((unsigned) beg) + (unsigned) (end - 1)) >> 1;
     rc = gpt_seq_cmp (gseq, &gpt_seqdb [*mid]);
@@ -561,6 +577,7 @@ premature:
 }
 
 static SNDFILE *recording = NULL;
+/// Opens the audio recording if necessary.
 void open_recording () {
   if (rec_fname != NULL && recording == NULL) {
     const char *dot = strrchr (rec_fname, '.');
@@ -578,18 +595,29 @@ void open_recording () {
   }
 }
 static sample_t get_jsample () {
-  static jack_nframes_t jdatalen = 0;
-  static sample_t *jdataptr = NULL,  ///< Beginning of current data in @c jbuf
-    *jdataend = NULL;  ///< End of current data in @c jbuf
+  static jack_nframes_t jdatalen = 0;  ///< Length of current chunk in @c jbuf
+  static sample_t *jdataptr = NULL,  ///< Beginning of current chunk in @c jbuf
+    *jdataend = NULL;  ///< End of current chunk in @c jbuf
   int rc;
 
   open_recording ();
 
   if (jdataptr == jdataend) {
+    struct sembuf sops = { .sem_num = 0, .sem_flg = 0 };
+
     jack_ringbuffer_read_advance (jbuf, jdatalen * sizeof (sample_t));
-    jdataptr = jdataend = NULL;
-    struct sembuf sops = { .sem_num = 0, .sem_op = -1, .sem_flg = 0 };
-    while ((rc = semop (jbufavail_semid, &sops, 1)) == -1)
+    if (jdatalen != 0) {
+      // signal remaining jdatalen - 1 frames of current chunk; we signalled
+      // the first one (wrongly) when blocking for the chunk, see below
+      sops.sem_op = -(jdatalen - 1);
+      ENSURE_SYSCALL (semop, (jbufavail_semid, &sops, 1));
+      jdataptr = jdataend = NULL; jdatalen = 0;
+    }
+
+    // wait for frames; inevitably this will wrongly signal one frame
+    // as available when in fact we're just about to read it, but the
+    // @c process_thread expects that.
+    while ((sops.sem_op = -1, rc = semop (jbufavail_semid, &sops, 1)) == -1)
       if (rc == -1 && errno != EINTR) {
         TRACE_PERROR (TRACE_FATAL, "semop");
         myshutdown (1);
@@ -597,18 +625,20 @@ static sample_t get_jsample () {
     int z;
     if (0 == sem_getvalue (&zombified, &z) && z > 0) myshutdown (1);
 
+    // how much contiguous data does the buffer think it has?
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
     jdatalen = jdatainfo [0].len / sizeof (sample_t);
     ASSERT (jdatalen > 0);
+
+    // only bite as much as we can thread-safely chew;
+    // since we've already waited for a frame ++rc
     if (-1 == (rc = semctl (jbufavail_semid, 0, GETVAL))) {
       TRACE_PERROR (TRACE_FATAL, "semctl");
       myshutdown (1);
     }
     if (jdatalen > (jack_nframes_t) ++rc) jdatalen = rc;
 
-    sops.sem_op = -(jdatalen - 1);
-    semop (jbufavail_semid, &sops, 1);
     jdataptr = (sample_t *) jdatainfo [0].buf;
     jdataend = jdataptr + jdatalen;
     if (recording != NULL)
@@ -637,10 +667,9 @@ static void *process_thread (void *arg) {
     // send queued up MIDI
     void *out = jack_port_get_buffer (jmidiport, nframes);
     jack_midi_clear_buffer (out);
-    rc = sem_getvalue (&jmidibuf_sem, &midicnt); assert (rc == 0);
+    ENSURE_SYSCALL_AND_SAVE (sem_getvalue, (&jmidibuf_sem, &midicnt), rc);
     char midi_data [jmidibuf_len];
-    rc = jack_ringbuffer_read (jmidibuf, midi_data, midicnt);
-    assert (rc == midicnt);
+    ENSURE_CALL (jack_ringbuffer_read, (jmidibuf, midi_data, midicnt) != (unsigned) midicnt);
     for (int i = 0; i < midicnt; ++i) {
       jack_midi_data_t *evt = jack_midi_event_reserve (out, 0, 3);
       if (evt == NULL) { lost_midi += midicnt - i; break; }
@@ -650,13 +679,15 @@ static void *process_thread (void *arg) {
 
     // queue up incoming audio
     sample_t *in = jack_port_get_buffer (jport, nframes);
-    if (-1 == (rc = semctl (jbufavail_semid, 0, GETVAL))) {
-      TRACE_PERROR (TRACE_FATAL, "semctl");
-      jack_cycle_signal (jclient, -1); break /* unreached */;
+    ENSURE_SYSCALL_AND_SAVE (semctl, (jbufavail_semid, 0, GETVAL), rc);
+    // semaphore could be off by 1, see @c get_jsample()
+    jack_nframes_t jbufavail = jbuf_len - rc - 2;
+    if (nframes > jbufavail) nframes = 0;
+    else {
+      jack_nframes_t nreq = nframes * sizeof (sample_t),
+        nwritten = jack_ringbuffer_write (jbuf, (const char *) in, nreq);
+      ASSERT (nwritten == nreq);
     }
-    if (nframes > jbuf_len - rc - 2) nframes = 0;
-    else
-      jack_ringbuffer_write (jbuf, (const char *) in, nframes * sizeof (sample_t));
     lost_frames += nframes_orig - nframes;
 
     jack_cycle_signal (jclient, 0);
@@ -665,10 +696,10 @@ static void *process_thread (void *arg) {
 
     if (nframes > 0) {  // inform audio consummer
       struct sembuf sops = { .sem_num = 0, .sem_op = nframes, .sem_flg = 0 };
-      semop (jbufavail_semid, &sops, 1);
+      ENSURE_SYSCALL (semop, (jbufavail_semid, &sops, 1));
     }
     for (int i = 0; i < midicnt; ++i) {  // subtract read MIDI notes
-      rc = sem_trywait (&jmidibuf_sem); assert (rc == 0);
+      ENSURE_SYSCALL (sem_trywait, (&jmidibuf_sem));
     }
     if (lost_midi > 0 || lost_frames > (srate / 50 /* == 20 ms */)) {
       // Log losses now if we can do it fast, else retry next time
@@ -947,7 +978,7 @@ static void parse_args (char **argv) {
         }
       } else if (0 == strcmp (*argv, "-c") || 0 == strcmp (*argv, "--chan")) {
         sscanf (*++argv, "%d", &midi_chan);
-        assert (midi_chan >= 0 && midi_chan < 128);
+        ASSERT (midi_chan >= 0 && midi_chan < 128);
       } else if (0 == strcmp (*argv, "--velo")) {
         sscanf (*++argv, "%d", &velo_on);
       } else if (0 == strcmp (*argv, "--velo-off")) {
@@ -1055,7 +1086,12 @@ static void myshutdown (int failure) {
 }
 
 static void sig_handler (int sig) {
-  // We are in the main thread -- all other threads block signals
+  // We should in the main thread -- all other threads block signals.
+  // But linked libs could screw up our sigmask and handlers...
+  if (! pthread_equal (pthread_self (), main_tid)) {
+    TRACE (TRACE_WARN, "Signal %d redirected to main thread", sig);
+    pthread_kill (main_tid, sig); for (;;) pause ();
+  }
   if (sig == SIGPIPE) return;  // we don't do pipes
   TRACE (TRACE_INFO, "Caught signal %d", sig);
   cleanup ();
@@ -1087,6 +1123,8 @@ void init_globals () {
 
 int main (int argc, char **argv) {
   (void) argc;
+
+  main_tid = pthread_self ();
 
   init_trace ();
 

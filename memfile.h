@@ -11,7 +11,7 @@
 #include "util.h"
 
 /// An in-memory file.
-/// Its methods contain no cancellation points (except asserts).
+/// Its methods contain no cancellation points (except possibly in asserts).
 typedef struct {
   char *buf1, *buf2, *ptr, *end, *other;
   size_t sz;
