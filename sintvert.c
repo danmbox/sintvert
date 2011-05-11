@@ -379,6 +379,7 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
   gridpt *seq = gseq.seq;
   float mindist = INFINITY, mindist_cnote = INFINITY;
   size_t minidx = 0, minidx_cnote = 0;
+  sample_t noise_tol = janls.noise_peak - stdmidi_anls.noise_peak;
 
   gpt_seq gseq_lo = gseq; gseq_lo.dur *= INV_SEMITONE_RATIO;
   gpt_seq gseq_hi = gseq; gseq_hi.dur *= SEMITONE_RATIO;
@@ -402,7 +403,9 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
     size_t j = 0;
     for (; j < gpt_buf_len; ++j) {
       sample_t x = seq [j].x;
-      if (x != 0 && fabsf (x / seq2 [j].x - 1) > 0.1) goto next_seq;
+      sample_t xdiff = fabsf (x - seq2 [j].x) - noise_tol;
+      if (x != 0 && fabsf (MAX (xdiff, 0) / seq2 [j].x) > 0.1)
+        goto next_seq;
       jack_nframes_t l = seq [j].framecnt, l2 = seq2 [j].framecnt;
       if (l != 0 && fabsf ((float) l / l2 - 1) > 0.15) goto next_seq;
       dist += SQR (l - l2) / dscale;
