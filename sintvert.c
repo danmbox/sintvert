@@ -264,10 +264,10 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   if (x > s->max_x) { s->max_x = x; TRACE (TRACE_INT + 2, "max_x = %.4g @%d", x, s->count); }
   if (x < s->min_x) { s->min_x = x; TRACE (TRACE_INT + 2, "min_x = %.4g @%d", x, s->count); }
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
-    s->voiced_ago = 0;
-    if (s->voiced_at == JACK_MAX_FRAMES) s->voiced_at = s->count;
     if (s->voiced_ago >= wavebrk_sil_frames)
       s->evt |= (1 << ANL_EVT_ZERO);
+    s->voiced_ago = 0;
+    if (s->voiced_at == JACK_MAX_FRAMES) s->voiced_at = s->count;
     if (absx > 5 * s->noise_peak && s->peak * (s->peak - x) <= 0) {
       s->peak = x;
       s->peak_at = s->after_peak_at = s->count;
@@ -293,6 +293,7 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   if (s->voiced_ago == wavebrk_sil_frames) {
     s->evt |= (1 << ANL_EVT_SIL);
     s->voiced_at = JACK_MAX_FRAMES;
+    s->peak = 0;
   }
   ++s->count;
   s->x = x;
