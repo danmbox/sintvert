@@ -180,6 +180,7 @@ typedef struct {
   size_t length;  ///< Number of points
   jack_nframes_t dur;  ///< Frame duration of this sequence
   int type;
+  jack_nframes_t pos;
   midi_note_t note;
 } gpt_seq;
 /// Determines sequence type based on initial 2 points
@@ -192,8 +193,8 @@ gpt_seq_type_t gpt_seq_type (gridpt *seq) {
 static char *gpt_seq_dump (const gpt_seq *gseq, char *buf, size_t sz) {
   static char buf_ [256]; if (buf == NULL) { buf = buf_; sz = sizeof (buf_); }
   memfile mf; memfile_init (&mf, sz, buf);
-  memfile_printf (&mf, "l=%d t=%d dur=%d note=%d",
-                  gseq->length, gseq->type, (int) gseq->dur, (int) gseq->note);
+  memfile_printf (&mf, "l=%d t=%d dur=%d note=%d p=%d",
+                  gseq->length, gseq->type, (int) gseq->dur, (int) gseq->note, gseq->pos);
   for (size_t i = 0; i < gseq->length; ++i)
     memfile_printf (&mf, " (%f %d)", gseq->seq [i].x, gseq->seq [i].framecnt);
   return buf;
@@ -322,6 +323,7 @@ static void gpt_seq_init (gpt_seq *entry, gridpt *seq, size_t len) {
   entry->seq = malloc (bytes); ASSERT (entry->seq != NULL);
   memcpy (entry->seq, seq, bytes);
   entry->dur = seq [len - 1].framecnt - seq [0].framecnt;
+  entry->pos = seq [0].framecnt;
   gpt_seq_fix_lengths (entry->seq, len);
   entry->length = len;
   entry->type = gpt_seq_type (seq);
