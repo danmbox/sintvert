@@ -277,7 +277,7 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
         s->after_peak_at = s->count;
     }
   }
-  sample_t border = (sample_t) copysign (s->noise_peak, s->peak);
+  sample_t border = 0 ; // (sample_t) copysign (s->noise_peak, s->peak);
   if (s->peak != 0.0 && (border - x) * (border - s->peak) <= 0) {
     s->evt |= (1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO);
     s->npeaks++;
