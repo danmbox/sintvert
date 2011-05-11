@@ -261,8 +261,8 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->sum += x; s->sum2 += SQR (x);
   s->evt = 0;
   sample_t absx = fabsf (x);
-  if (x > s->max_x) s->max_x = x;
-  if (x < s->min_x) s->min_x = x;
+  if (x > s->max_x) { s->max_x = x; TRACE (TRACE_INT + 2, "max_x = %f @%d", x, s->count); }
+  if (x < s->min_x) { s->min_x = x; TRACE (TRACE_INT + 2, "min_x = %f @%d", x, s->count); }
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
     s->voiced_ago = 0;
     if (s->voiced_at == JACK_MAX_FRAMES) s->voiced_at = s->count;
@@ -302,6 +302,7 @@ static jack_nframes_t gpt_buf_dur (int i) {
   return (gpt_buf [gpt_buf_len - 1].framecnt - gpt_buf [i].framecnt);
 }
 static float gpt_buf_add (sample_t x, jack_nframes_t count) {
+  TRACE (TRACE_INT + 1, "pt x=%f @%d", x, count);
   ASSERT (gpt_buf_len < gpt_buf_max);
   gpt_buf [gpt_buf_len].x = x;
   gpt_buf [gpt_buf_len].framecnt = count;
@@ -421,8 +422,8 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
     }
   next_seq:
     if (dist > 0.0)
-      TRACE (TRACE_INT + 2, "tried note %d j=%d/%d d=%lf",
-             (int) gpt_seqdb [i].note, j, gpt_buf_len, dist);
+      TRACE (TRACE_INT + 2, "tried note=%d j=%d/%d d=%lf i=%d",
+             (int) gpt_seqdb [i].note, j, gpt_buf_len, dist, i);
   }
 
   if (isinf (mindist_cnote) && isfinite (state->dist))
@@ -568,7 +569,7 @@ static void load_waveform_db () {
   for (size_t i = 0; i < gpt_seqdb_len; ++i) {
     char buf [2048]; gpt_seq_dump (&gpt_seqdb [i], buf, sizeof (buf));
     TRACE (TRACE_INT, "seq i=%d %s", i, buf);
-    if (i % 10 == 0) trace_flush ();
+    if (i % 100 == 0) trace_flush ();
   }
   TRACE (TRACE_INFO, "%d sequences loaded from training file", (int) gpt_seqdb_len);
 
@@ -783,6 +784,7 @@ static int queue_note (midi_note_t note, int on) {
 /// Loops listening for audio, recognizing notes and queueing up MIDI.
 static void midi_server () {
   midi_note_t cnote = MIDI_NOTE_NONE;
+  jack_nframes_t note_onset = JACK_MAX_FRAMES;
   gpt_seq_anl_state gpbs; gpt_seq_anl_state_init (&gpbs);
   TRACE (TRACE_IMPT, "MIDI server started, delay %lf", recog_ms);
   gpt_buf_len = 0;
@@ -791,9 +793,11 @@ static void midi_server () {
     analyze_sample (get_jsample (), &janls);
     if ((janls.evt & (1 << ANL_EVT_SIL)) != 0 && cnote != MIDI_NOTE_NONE) {
       if (queue_note (cnote, 0)) sem_post (&jmidibuf_sem);
+      char scinote [4]; note_midi2sci (cnote, scinote);
+      TRACE (TRACE_INFO, "Note %s off (length=%.2f ms)", scinote,
+             ((float) (janls.count - note_onset)) / srate * 1000.0);
       cnote = MIDI_NOTE_NONE;
       gpt_seq_anl_state_init (&gpbs);
-      TRACE (TRACE_INFO, "Note off");
       gpt_buf_len = 0;
     }
     if ((janls.evt & ((1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO))) != 0)
@@ -820,9 +824,11 @@ static void midi_server () {
 
           char scinote [4]; note_midi2sci (note, scinote);
           if (cnote == MIDI_NOTE_NONE)  // first note in a run
-            TRACE (TRACE_INFO, "Note %s (delay=%.1f ms)",
-                   scinote, ((float) (janls.count - janls.voiced_at) / srate * 1000.0));
-          else TRACE (TRACE_INFO, "Note %s", scinote);
+            TRACE (TRACE_INFO, "Note %s (delay=%.2f ms)", scinote,
+                   ((float) (janls.count - janls.voiced_at) / srate * 1000.0));
+          else TRACE (TRACE_INFO, "Note %s (after=%.2f ms)", scinote,
+                      ((float) (janls.count - note_onset) / srate * 1000.0));
+          note_onset = janls.count;
           cnote = note;
         }
       }
