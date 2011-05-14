@@ -180,7 +180,8 @@ typedef struct {
   size_t length;  ///< Number of points
   jack_nframes_t dur;  ///< Frame duration of this sequence
   int type;
-  jack_nframes_t pos;
+  jack_nframes_t pos,  ///< Original frame count of sequence
+    t_avg;  ///< Average of all feature points @c framecnt
   midi_note_t note;
 } gpt_seq;
 /// Determines sequence type based on initial 2 points
@@ -327,6 +328,9 @@ static void gpt_seq_init (gpt_seq *entry, gridpt *seq, size_t len) {
   entry->dur = seq [len - 1].framecnt - seq [0].framecnt;
   entry->pos = seq [0].framecnt;
   gpt_seq_fix_lengths (entry->seq, len);
+  entry->t_avg = 0;
+  for (size_t i = 0; i < len; i++) entry->t_avg += entry->seq [i].framecnt;
+  entry->t_avg /= len;
   entry->length = len;
   entry->type = gpt_seq_type (seq);
   entry->note = MIDI_NOTE_NONE;
@@ -395,12 +399,12 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
     else if (rc1 > 0) goto ret;
   }
 
-  for (i = lo; i < gpt_seqdb_len && gpt_seq_cmp (&gpt_seqdb [i], &gseq_hi) <= 0; ++i)
-  {
-    midi_note_t newnote = gpt_seqdb [i].note;
+  for (i = lo; i < gpt_seqdb_len && gpt_seq_cmp (&gpt_seqdb [i], &gseq_hi) <= 0; ++i) {
+    const gpt_seq *gseq2 = &gpt_seqdb [i];
+    midi_note_t newnote = gseq2->note;
     if (! note_scale [newnote % 12]) continue;
-    gridpt *seq2 = gpt_seqdb [i].seq;
-    float dscale = (double) SQR (gpt_seqdb [i].dur) / (gpt_buf_len - 1);
+    gridpt *seq2 = gseq2->seq;
+    float dscale = (double) SQR (gseq2->dur) / (gpt_buf_len - 1);
     sample_t dist = 0.0;
     size_t j = 0;
     for (; j < gpt_buf_len; ++j) {
@@ -408,9 +412,10 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
       sample_t xdiff = fabsf (x - seq2 [j].x) - noise_tol;
       if (x != 0 && fabsf (MAX (xdiff, 0) / seq2 [j].x) > 0.1)
         goto next_seq;
-      jack_nframes_t l = seq [j].framecnt, l2 = seq2 [j].framecnt;
-      if (l != 0 && fabsf ((float) l / l2 - 1) > 0.15) goto next_seq;
-      dist += SQR (l - l2) / dscale;
+      jack_nframes_t t = seq [j].framecnt - gseq.t_avg,
+        t2 = seq2 [j].framecnt - gseq2->t_avg;
+      if (t2 != 0 && fabsf ((float) t / t2 - 1) > 0.15) goto next_seq;
+      dist += SQR (t - t2) / dscale;
       if (newnote != state->note && dist > mindist) goto next_seq;
     }
     if (dist < mindist) {
@@ -424,7 +429,7 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
   next_seq:
     if (dist > 0.0)
       TRACE (TRACE_INT + 2, "tried note=%d j=%d/%d d=%lf i=%d",
-             (int) gpt_seqdb [i].note, j, gpt_buf_len, dist, i);
+             (int) newnote, j, gpt_buf_len, dist, i);
   }
 
   if (isinf (mindist_cnote) && isfinite (state->dist))
