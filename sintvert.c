@@ -196,7 +196,7 @@ static char *gpt_seq_dump (const gpt_seq *gseq, char *buf, size_t sz) {
   memfile_printf (&mf, "l=%d t=%d dur=%d note=%d p=%d",
                   gseq->length, gseq->type, (int) gseq->dur, (int) gseq->note, gseq->pos);
   for (size_t i = 0; i < gseq->length; ++i)
-    memfile_printf (&mf, " (%f %d)", gseq->seq [i].x, gseq->seq [i].framecnt);
+    memfile_printf (&mf, " (%.4g %d)", gseq->seq [i].x, gseq->seq [i].framecnt);
   return buf;
 }
 /// Rough comparison function based on @c gpt_seq's @c length and @c type
@@ -261,8 +261,8 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   s->sum += x; s->sum2 += SQR (x);
   s->evt = 0;
   sample_t absx = fabsf (x);
-  if (x > s->max_x) { s->max_x = x; TRACE (TRACE_INT + 2, "max_x = %f @%d", x, s->count); }
-  if (x < s->min_x) { s->min_x = x; TRACE (TRACE_INT + 2, "min_x = %f @%d", x, s->count); }
+  if (x > s->max_x) { s->max_x = x; TRACE (TRACE_INT + 2, "max_x = %.4g @%d", x, s->count); }
+  if (x < s->min_x) { s->min_x = x; TRACE (TRACE_INT + 2, "min_x = %.4g @%d", x, s->count); }
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
     s->voiced_ago = 0;
     if (s->voiced_at == JACK_MAX_FRAMES) s->voiced_at = s->count;
@@ -302,7 +302,7 @@ static jack_nframes_t gpt_buf_dur (int i) {
   return (gpt_buf [gpt_buf_len - 1].framecnt - gpt_buf [i].framecnt);
 }
 static float gpt_buf_add (sample_t x, jack_nframes_t count) {
-  TRACE (TRACE_INT + 1, "pt x=%f @%d", x, count);
+  TRACE (TRACE_INT + 1, "pt x=%g @%d", x, count);
   ASSERT (gpt_buf_len < gpt_buf_max);
   gpt_buf [gpt_buf_len].x = x;
   gpt_buf [gpt_buf_len].framecnt = count;
