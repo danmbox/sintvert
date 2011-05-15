@@ -50,6 +50,7 @@ int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
 float noise_sigmas = 8;  ///< # of standard deviations for noise threshold
 int noise_range_use_max = 0;  ///< Use observed noise range for estimation?
 double after_peak_frac = 0.9;  ///< Fraction of last peak height to watch for
+double peak2noise_ratio = 5;  ///< Threshold for acceptable peaks
 int initial_sil_ms = 1000;    ///< duration of segment for noise estimation
 double wavebrk_sil_ms = 1.5;  ///< msecs triggering silence detection
 double recog_ms = 12;         ///< min duration of a recognizable @c gpt_seq
@@ -127,6 +128,7 @@ typedef struct {
     max_x,  ///< Maximum (positive) value ever
     min_x,  ///< Minimum (negative) value ever
     max_peak,  ///< Largest peak
+    zero1,  ///< Amplitude for 1st zero after silence
     noise_peak;  ///< Estimated noise level
   long double sum,   ///< running sum of samples
     sum2;  ///< running sum of squares of samples
@@ -146,7 +148,7 @@ void sample_anl_state_init (sample_anl_state *s) {
   s->max_x = -INFINITY; s->min_x = INFINITY;
   s->dc = 0; s->norm_factor = 1;
   s->voiced_ago = s->voiced_at = JACK_MAX_FRAMES;
-  s->sum = 0;
+  s->sum = s->sum2 = 0;
 }
 /// Computes the @c dc offset, removes it from statistics.
 void sample_anl_state_unbias (sample_anl_state *s) {
@@ -247,7 +249,6 @@ jack_nframes_t jbuf_len = 16384, jmidibuf_len = 128;
 int jbufavail_semid;
 int jbufavail_valid = 0;  ///< Is @c jbufavail_semid allocated?
 sem_t jmidibuf_sem;  ///< Counting semaphore for @c jmidibuf (in events)
-sample_t norm_noise_peak = 0;  ///< Estimated noise amplitude in training file
 sample_anl_state stdmidi_anls;  ///< State for calibration note analyzer
 sample_anl_state janls;  ///< Analyzer state for jack samples
 gridpt *gpt_buf = NULL;  ///< Buffer of current feature points
@@ -265,11 +266,14 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   if (x > s->max_x) { s->max_x = x; TRACE (TRACE_INT + 2, "max_x = %.4g @%d", x, s->count); }
   if (x < s->min_x) { s->min_x = x; TRACE (TRACE_INT + 2, "min_x = %.4g @%d", x, s->count); }
   if (s->noise_peak > 0.0 && absx > s->noise_peak) {
-    if (s->voiced_ago >= wavebrk_sil_frames)
-      s->evt |= (1 << ANL_EVT_ZERO);
     s->voiced_ago = 0;
     if (s->voiced_at == JACK_MAX_FRAMES) s->voiced_at = s->count;
-    if (absx > 5 * s->noise_peak && s->peak * (s->peak - x) <= 0) {
+    if (s->old_peak == 0.0 && absx > s->zero1) {
+      TRACE (TRACE_INT + 2, "initial 0=%f @%d", x, s->count);
+      s->evt |= (1 << ANL_EVT_ZERO);  // initial zero
+      s->old_peak = s->noise_peak;  // hack: mark that we've emitted it
+    }
+    if (absx > peak2noise_ratio * s->noise_peak && s->peak * (s->peak - x) <= 0) {
       s->peak = x;
       s->peak_at = s->after_peak_at = s->count;
     } else {
@@ -294,7 +298,7 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
   if (s->voiced_ago == wavebrk_sil_frames) {
     s->evt |= (1 << ANL_EVT_SIL);
     s->voiced_at = JACK_MAX_FRAMES;
-    s->peak = 0;
+    s->peak = s->old_peak = 0;
   }
   ++s->count;
   s->x = x;
@@ -490,11 +494,12 @@ static void load_waveform_db () {
     analyze_sample (x, &anls);
   }
   sample_anl_state_unbias (&anls);
-  norm_noise_peak = anls.noise_peak = noise_range_use_max ?
+  anls.noise_peak = noise_range_use_max ?
     1.1 * (anls.max_x - anls.min_x) :
     noise_sigmas * anls.sigma;
+  anls.zero1 = anls.noise_peak * peak2noise_ratio * 0.8;
   TRACE (TRACE_DIAG, "Noise peak in db file: %.5f, DC=%.5f",
-         (float) norm_noise_peak, (float) anls.dc);
+         (float) anls.noise_peak, (float) anls.dc);
 
   for (midi_note_t note = lomidi; note <= himidi; ++note) {
     double note_period = 1 / note_midi2freq (note);
@@ -526,7 +531,7 @@ static void load_waveform_db () {
 #undef TEST
           // TEST succeeds if a point was added & seq duration reaches threshold
           while (gpt_buf_len > gpt_seq_min_cnt &&
-                 gpt_buf_dur (0) > (recog_frames + note_period * srate / 4) * SEMITONE_RATIO)
+                 gpt_buf_dur (0) > (recog_frames + note_period * srate / 4) * SQR (SEMITONE_RATIO))
             gpt_buf_shift ();
           gpt_seq_add_all (note, INV_SEMITONE_RATIO * recog_frames);
         }
@@ -770,6 +775,7 @@ static void calibrate () {
     myshutdown (1);
   }
   sample_anl_state_norm (&janls, stdmidi_anls.max_peak / janls.max_peak);
+  janls.zero1 = stdmidi_anls.zero1;
   TRACE (TRACE_INFO, "Scaling factor against training file: %f", (float) janls.norm_factor);
 
   // skip rest of note
