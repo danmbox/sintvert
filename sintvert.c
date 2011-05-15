@@ -408,7 +408,10 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
     midi_note_t newnote = gseq2->note;
     if (! note_scale [newnote % 12]) continue;
     gridpt *seq2 = gseq2->seq;
-    float dscale = (double) SQR (gseq2->dur) / (gpt_buf_len - 1);
+    // distance = (dur1 / dur2 - 1)^2 / dscale for identical waveforms
+    // works for both even and odd gpt_buf_len
+    float dscale = (double) SQR (gseq2->dur) *
+      gpt_buf_len * (gpt_buf_len + 1) / ((gpt_buf_len - 1) * 12.0);
     sample_t dist = 0.0;
     size_t j = 0;
     for (; j < gpt_buf_len; ++j) {
@@ -443,7 +446,7 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
   if (isfinite (mindist)) {
     minnote = gpt_seqdb [minidx].note;
     if (minnote == state->note ||
-        (mindist < SQR (SEMITONE_RATIO - 1) && mindist * QTTONE_RATIO <= mindist_cnote))
+        (mindist < SQR (QTTONE_RATIO - 1) && mindist * QTTONE_RATIO <= mindist_cnote))
     {
       note = state->note = minnote;
     }
