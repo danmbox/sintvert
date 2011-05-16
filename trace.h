@@ -53,6 +53,8 @@ static void trace_msg (trace_pri_t pri, const char *fn, const char *fmt, ...)
 static void trace_flush () {
   MUTEX_LOCK_WITH_CLEANUP (&trace_buf->switchlock); {
     memfile_switchbuf (trace_buf);
+    char *overflow_ch = &trace_buf->other [trace_buf->sz - 2];
+    if (*overflow_ch != '\0') *overflow_ch = '\n';
     fprintf (stdtrace, "%s", trace_buf->other);  // cancellation point
   } pthread_cleanup_pop (1);
   fflush (stdtrace);

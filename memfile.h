@@ -41,10 +41,12 @@ static memfile *memfile_alloc (size_t sz) {
 }
 /// Switches the active and shadow buffers of @p f.
 /// Locks @p f's switchlock, then its lock.
+/// Marks the 2nd-to-last char in old buffer as NUL unless overflow occurred.
 static void memfile_switchbuf (memfile *f) {
   MUTEX_LOCK_WITH_CLEANUP (&f->switchlock);
   MUTEX_LOCK_WITH_CLEANUP (&f->lock);
   assert (f->other != NULL);
+  if (f->end - f->ptr >= 2) *(f->end - 2) = '\0';  // help overflow detection
   f->other [0] = '\0';
   f->ptr = f->other; f->end = f->other + f->sz;
   f->other = f->other == f->buf1 ? f->buf2 : f->buf1;
