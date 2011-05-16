@@ -51,6 +51,7 @@ float noise_sigmas = 8;  ///< # of standard deviations for noise threshold
 int noise_range_use_max = 0;  ///< Use observed noise range for estimation?
 double after_peak_frac = 0.9;  ///< Fraction of last peak height to watch for
 double peak2noise_ratio = 5;  ///< Threshold for acceptable peaks
+double xtol = 0.1;            ///< Leeway to allow in amplitudes
 int initial_sil_ms = 1000;    ///< duration of segment for noise estimation
 double wavebrk_sil_ms = 1.5;  ///< msecs triggering silence detection
 double recog_ms = 12;         ///< min duration of a recognizable @c gpt_seq
@@ -429,7 +430,7 @@ static midi_note_t gpt_seq_analyze (gpt_seq_anl_state *state) {
     for (; j < gpt_buf_len; ++j) {
       sample_t x = seq [j].x;
       sample_t xdiff = fabsf (x - seq2 [j].x) - noise_tol;
-      if (x != 0 && fabsf (MAX (xdiff, 0) / seq2 [j].x) > 0.1)
+      if (x != 0 && fabsf (MAX (xdiff, 0) / seq2 [j].x) > xtol)
         goto next_seq;
       jack_nframes_t t = seq [j].framecnt - gseq.t_avg,
         t2 = seq2 [j].framecnt - gseq2->t_avg;
@@ -510,7 +511,7 @@ static void load_waveform_db () {
   }
   sample_anl_state_unbias (&anls);
   anls.noise_peak = noise_range_use_max ?
-    1.1 * (anls.max_x - anls.min_x) :
+    (1 + xtol) * (anls.max_x - anls.min_x) :
     noise_sigmas * anls.sigma;
   anls.zero1 = anls.noise_peak * peak2noise_ratio * 0.8;
   TRACE (TRACE_DIAG, "Noise peak in db file: %.5f, DC=%.5f",
@@ -760,7 +761,7 @@ static void calibrate () {
     analyze_sample (get_jsample (), &janls);
   sample_anl_state_unbias (&janls);
   janls.noise_peak = noise_range_use_max ?
-    1.1 * (janls.max_x - janls.min_x) :
+    (1 + xtol) * (janls.max_x - janls.min_x) :
     noise_sigmas * janls.sigma;
   TRACE (TRACE_DIAG, "Noise peak in input: %.5f, DC=%.5f",
          (float) janls.noise_peak, (float) janls.dc);
@@ -783,7 +784,7 @@ static void calibrate () {
     if (janls.npeaks == stdmidi_anls.max_peak_idx + 1)
       peak_at_old_idx = ABS (janls.old_peak);
   }
-  if (fabsf (janls.top_peak [0] / peak_at_old_idx - 1) > 0.1) {
+  if (fabsf (janls.top_peak [0] / peak_at_old_idx - 1) > xtol) {
     TRACE (TRACE_FATAL, "Mismatched waveform i=%d/%d (expected %d) peak=%f (vs. %f)",
                janls.max_peak_idx, janls.npeaks, stdmidi_anls.max_peak_idx,
                janls.top_peak [0], peak_at_old_idx);
@@ -959,6 +960,8 @@ NL "  --min-per PER      Minimum recognizable # of periods (>= 0.5, default 2)"
 NL "  --train-max MSEC   Truncate notes to MSEC during training (default 250)"
 NL "  --noise-range S    Noise threshold (in standard deviations, default 8);"
 NL "                     use 'max' to base on actual observed range"
+NL "  --xtol FRAC        Tolerance for amplitudes (default 0.1)"
+NL ""
 NL "MIDI options:"
 NL "  -c, --chan C       MIDI channel number (default 0)"
 NL "  --velo V           MIDI note-on velocity (default 100)"
@@ -1024,6 +1027,8 @@ static void parse_args (char **argv) {
         sscanf (*++argv, "%lf", &train_max_ms);
       } else if (0 == strcmp (*argv, "--aftpk-frac")) {
         sscanf (*++argv, "%lf", &after_peak_frac);
+      } else if (0 == strcmp (*argv, "--xtol")) {
+        sscanf (*++argv, "%lf", &xtol);
       } else if (0 == strcmp (*argv, "--min-per")) {
         double f; sscanf (*++argv, "%lf", &f);
         if (f < 0.5) usage ("Bad minimum periods %lf", f);
