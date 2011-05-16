@@ -237,7 +237,7 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
     s->evt |= (1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO);
     s->npeaks++;
     sample_t abs_peak = ABS (s->peak);
-    if (s->peak > s->max_peak) {
+    if (abs_peak > s->max_peak) {
       s->max_peak = abs_peak;
       s->max_peak_idx = s->npeaks - 1;
     }
