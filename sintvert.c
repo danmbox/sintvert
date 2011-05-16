@@ -127,7 +127,7 @@ typedef struct {
     old_peak,  ///< Latest confirmed peak
     max_x,  ///< Maximum (positive) value ever
     min_x,  ///< Minimum (negative) value ever
-    max_peak,  ///< Largest peak
+    top_peak [6],  ///< Largest peaks
     zero1,  ///< Amplitude for 1st zero after silence
     noise_peak;  ///< Estimated noise level
   long double sum,   ///< running sum of samples
@@ -143,6 +143,12 @@ typedef struct {
 typedef enum {
   ANL_EVT_PEAK = 0, ANL_EVT_ZERO, ANL_EVT_SIL
 } sample_anl_event_bit;
+void sample_anl_state_init_top_peaks (sample_anl_state *s) {
+  for (size_t i = 0; i < sizeof (s->top_peak) / sizeof (s->top_peak [0]); ++i)
+    s->top_peak [i] = 0;
+  s->npeaks = 0;
+  s->max_peak_idx = 0;
+}
 void sample_anl_state_init (sample_anl_state *s) {
   memset (s, 0, sizeof (*s));
   s->max_x = -INFINITY; s->min_x = INFINITY;
@@ -287,9 +293,15 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
     s->evt |= (1 << ANL_EVT_PEAK) | (1 << ANL_EVT_ZERO);
     s->npeaks++;
     sample_t abs_peak = ABS (s->peak);
-    if (abs_peak > s->max_peak) {
-      s->max_peak = abs_peak;
-      s->max_peak_idx = s->npeaks - 1;
+    size_t ntop_pks = sizeof (s->top_peak) / sizeof (s->top_peak [0]),
+      i = ntop_pks;
+    for (; i > 0 && abs_peak >= s->top_peak [i - 1]; --i);
+    if (i < ntop_pks) {
+      memmove (&s->top_peak [i + 1], &s->top_peak [i],
+               (ntop_pks - i - 1) * sizeof (s->top_peak [0]));
+      s->top_peak [i] = abs_peak;
+      if (i == 0)
+        s->max_peak_idx = s->npeaks - 1;
     }
     s->old_peak = s->peak;
     s->peak = 0.0;
@@ -548,7 +560,7 @@ static void load_waveform_db () {
     if (note == stdmidi) {  // go back and analyze it
       sf_count_t saved_pos = my_sf_tell (dbf);
       sf_seek (dbf, note_pos, SEEK_SET);
-      stdanls.npeaks = 0; stdanls.max_peak = 0; stdanls.max_peak_idx = 0;
+      sample_anl_state_init_top_peaks (&stdanls);
       TRACE (TRACE_INT, "Back to frame=%ld for stdmidi",
                  (long) my_sf_tell (dbf));
       // gather calibration info
@@ -771,13 +783,26 @@ static void calibrate () {
     if (janls.npeaks == stdmidi_anls.max_peak_idx + 1)
       peak_at_old_idx = ABS (janls.old_peak);
   }
-  if (fabsf (janls.max_peak / peak_at_old_idx - 1) > 0.1) {
+  if (fabsf (janls.top_peak [0] / peak_at_old_idx - 1) > 0.1) {
     TRACE (TRACE_FATAL, "Mismatched waveform i=%d/%d (expected %d) peak=%f (vs. %f)",
                janls.max_peak_idx, janls.npeaks, stdmidi_anls.max_peak_idx,
-               janls.max_peak, peak_at_old_idx);
+               janls.top_peak [0], peak_at_old_idx);
     myshutdown (1);
   }
-  sample_anl_state_norm (&janls, stdmidi_anls.max_peak / janls.max_peak);
+
+  {
+    size_t i = 0;
+    double factor = 0;
+    for (; i < sizeof (janls.top_peak) / sizeof (janls.top_peak [0]); ++i) {
+      double stdp = stdmidi_anls.top_peak [i], jp = janls.top_peak [i];
+      if (stdp > 0.0 && jp > 0.0) {
+        TRACE (TRACE_INT, "peaks n=%d: %lf / %lf = %lf", i, stdp, jp, stdp / jp);
+        factor += stdp / jp;
+      }
+      else break;
+    }
+    sample_anl_state_norm (&janls, factor / i);
+  }
   janls.zero1 = stdmidi_anls.zero1;
   TRACE (TRACE_INFO, "Scaling factor against training file: %f", (float) janls.norm_factor);
 
