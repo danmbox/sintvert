@@ -48,7 +48,8 @@ int velo_on = 100,  ///< MIDI velocity of note-on
 int midi_chan = 0;  ///< MIDI channel to send notes on
 int stdmidi_npeaks = 50;  ///< # of peaks to read for calibration
 float noise_sigmas = 8;  ///< # of standard deviations for noise threshold
-int noise_range_use_max = 0;  ///< Use observed noise range for estimation?
+/// Use this multiplier of the observed noise range for estimation (if > 0)?
+float noise_range_use_max = 0;
 double after_peak_frac = 0.9;  ///< Fraction of last peak height to watch for
 double peak2noise_ratio = 5;  ///< Threshold for acceptable peaks
 double xtol = 0.1;            ///< Leeway to allow in amplitudes
@@ -510,8 +511,8 @@ static void load_waveform_db () {
     analyze_sample (x, &anls);
   }
   sample_anl_state_unbias (&anls);
-  anls.noise_peak = noise_range_use_max ?
-    (1 + xtol) * (anls.max_x - anls.min_x) :
+  anls.noise_peak = noise_range_use_max != 0.0 ?
+    (1 + xtol) * noise_range_use_max * (anls.max_x - anls.min_x) / 2 :
     noise_sigmas * anls.sigma;
   anls.zero1 = anls.noise_peak * peak2noise_ratio * 0.8;
   TRACE (TRACE_DIAG, "Noise peak in db file: %.5f, DC=%.5f",
@@ -761,7 +762,7 @@ static void calibrate () {
     analyze_sample (get_jsample (), &janls);
   sample_anl_state_unbias (&janls);
   janls.noise_peak = noise_range_use_max ?
-    (1 + xtol) * (janls.max_x - janls.min_x) :
+    (1 + xtol) * noise_range_use_max * (janls.max_x - janls.min_x) / 2 :
     noise_sigmas * janls.sigma;
   TRACE (TRACE_DIAG, "Noise peak in input: %.5f, DC=%.5f",
          (float) janls.noise_peak, (float) janls.dc);
@@ -959,7 +960,7 @@ NL "  -d, --delay MSEC   Shortest duration of a recognizable waveform"
 NL "  --min-per PER      Minimum recognizable # of periods (>= 0.5, default 2)"
 NL "  --train-max MSEC   Truncate notes to MSEC during training (default 250)"
 NL "  --noise-range S    Noise threshold (in standard deviations, default 8);"
-NL "                     use 'max' to base on actual observed range"
+NL "                     use 'max[*factor]' to base on actual observed range"
 NL "  --xtol FRAC        Tolerance for amplitudes (default 0.1)"
 NL ""
 NL "MIDI options:"
@@ -1035,10 +1036,12 @@ static void parse_args (char **argv) {
         gpt_seq_min_cnt = 0.1 + round (4 * f);
       } else if (0 == strcmp (*argv, "--noise-range")) {
         if (sscanf (*++argv, "%f", &noise_sigmas) < 1) {
-          if (0 == strcmp (*argv, "max"))
+          if (0 == strncmp (*argv, "max", 3)) {
             noise_range_use_max = 1;
-          else
-            usage ("Bad noise range %s", *argv);
+            if (0 == strncmp (*argv, "max*", 4))
+              sscanf (*argv + 4, "%f", &noise_range_use_max);
+          }
+          else usage ("Bad noise range %s", *argv);
         }
       } else if (0 == strcmp (*argv, "-c") || 0 == strcmp (*argv, "--chan")) {
         sscanf (*++argv, "%d", &midi_chan);
