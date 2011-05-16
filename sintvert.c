@@ -502,6 +502,7 @@ static void load_waveform_db () {
   gpt_seqdb = malloc (gpt_seqdb_max * sizeof (gpt_seq));
   ASSERT (gpt_seqdb != NULL);
 
+start: (void) 0;
   double x;
   sample_anl_state anls; sample_anl_state_init (&anls);
 
@@ -530,6 +531,7 @@ static void load_waveform_db () {
     TRACE (TRACE_INT, "Found note at frame=%ld", (long) my_sf_tell (dbf));
 
     sf_count_t note_pos = my_sf_tell (dbf);
+    int seqs_before_note = gpt_seqdb_len;
     anls.count = 1;
     sample_anl_state stdanls = anls;
     gpt_buf_len = 0;
@@ -556,8 +558,18 @@ static void load_waveform_db () {
       if (sf_read_double (dbf, &x, 1) < 1) goto premature;
       analyze_sample (x, &anls);
     } while ((anls.evt & (1 << ANL_EVT_SIL)) == 0);
-    TRACE (TRACE_INT, "MIDI note %d Waveform ends at frame=%ld, seqs=%d",
-           (int) note, (long) my_sf_tell (dbf), gpt_seqdb_len);
+    if (gpt_seqdb_len - seqs_before_note < 3) {
+      TRACE (TRACE_ERR, "False note detected, noise range probably too small; increasing by 20%%");
+      if (noise_range_use_max > 0.0) noise_range_use_max *= 1.2;
+      else noise_sigmas *= 1.2;
+      sf_seek (dbf, 0, SEEK_SET);
+      for (; gpt_seqdb_len > 0; --gpt_seqdb_len)
+        free (gpt_seqdb [gpt_seqdb_len - 1].seq);
+      goto start;
+    }
+    TRACE (TRACE_INT, "MIDI note %d Waveform ends at frame=%ld, seqs=%d/%d",
+           (int) note, (long) my_sf_tell (dbf),
+           gpt_seqdb_len - seqs_before_note, gpt_seqdb_len);
 
     if (note == stdmidi) {  // go back and analyze it
       sf_count_t saved_pos = my_sf_tell (dbf);
