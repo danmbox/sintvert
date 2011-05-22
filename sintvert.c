@@ -1173,7 +1173,6 @@ static void setup_sigs () {
   int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT, SIGALRM };
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
     ENSURE_SYSCALL (sigaddset, (&sigmask, sigarr [i]));
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
   struct sigaction act =
     { .sa_mask = sigmask, .sa_flags = 0, .sa_handler = sig_handler };
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
@@ -1201,13 +1200,15 @@ int main (int argc, char **argv) {
 
   parse_args (argv);
 
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
   pthread_create (&poll_thread_tid, NULL, poll_thread, NULL);
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   load_waveform_db ();
 
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
   setup_audio ();
-
-  pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   calibrate ();
 
