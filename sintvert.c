@@ -267,6 +267,7 @@ size_t gpt_seqdb_max = 20000 /* grows */,
   gpt_seqdb_len = 0;  ///< Current size of @c gpt_seqdb
 
 void analyze_sample (sample_t x, sample_anl_state * const s) {
+  ++s->count;
   x -= s->dc; x *= s->norm_factor;
   s->sum += x; s->sum2 += SQR (x);
   s->evt = 0;
@@ -314,7 +315,6 @@ void analyze_sample (sample_t x, sample_anl_state * const s) {
     s->voiced_at = JACK_MAX_FRAMES;
     s->peak = s->old_peak = 0;
   }
-  ++s->count;
   s->x = x;
 }
 
