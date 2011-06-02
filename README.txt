@@ -48,7 +48,7 @@ cd build; tar cvzf ../sintvert.tar.gz
 
 4. RUNNING
 
-See sintvert --help (or the manpage).
+See sintvert --help (or the manpage) for usage.
 
 
 5. COPYRIGHT:
