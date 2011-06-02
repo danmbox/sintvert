@@ -13,13 +13,16 @@ with a few seconds of silence at the beginning. Create this file by
 recording output from your keyboard or synthesizer. Try to pick a
 "clean" patch, i.e. one which has no echo (there is no sound after you
 release a key), little LFO, and which looks as close as possible to a
-sine wave.
+sine wave. On my old Casio I use the Bassoon patch. Higher-pitched
+instruments are preferrable if available.
 
 After loading this training file, the program expects you to press the
-middle C key on your synth once for amplitude calibration. The program
-estimates the loudness of the input signal compared to the training
-file, then starts recognizing notes and sending MIDI messages until
-killed.
+middle C key once on your keyboard for amplitude calibration. The
+program estimates the loudness of the input signal compared to the
+training file, then starts recognizing notes and sending MIDI messages
+until killed.
+
+sintvert runs under Jack (http://jackaudio.org/).
 
 
 2. DEPENDENCIES:
