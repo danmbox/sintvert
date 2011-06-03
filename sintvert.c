@@ -237,7 +237,7 @@ static void myshutdown (int failure);
 // internal vars
 sigset_t sigmask;
 pthread_t poll_thread_tid = 0; int poll_thread_started = 0;
-pthread_t main_tid = 0;
+pthread_t main_tid;
 jack_nframes_t initial_sil_frames = 0,
   wavebrk_sil_frames = 0,
   recog_frames = 0,
@@ -1199,6 +1199,7 @@ static void setup_sigs () {
 /// Initialize variables and resources that cannot be initialized statically.
 /// Postcondition: all globals must be in a defined state.
 void init_globals () {
+  main_tid = pthread_self ();
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
   ENSURE_SYSCALL (sem_init, (&jmidibuf_sem, 0, 0));
@@ -1206,8 +1207,6 @@ void init_globals () {
 
 int main (int argc, char **argv) {
   (void) argc;
-
-  main_tid = pthread_self ();
 
   init_trace ();
 
