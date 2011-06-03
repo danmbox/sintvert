@@ -1153,7 +1153,7 @@ static void sig_handler (int sig) {
 }
 
 static void setup_sigs () {
-  int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGILL, SIGBUS, SIGFPE, SIGINT, SIGALRM };
+  int sigarr [] = { SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGFPE, SIGINT, SIGALRM };
   for (unsigned i = 0; i < sizeof (sigarr) / sizeof (sigarr [0]); ++i)
     ENSURE_SYSCALL (sigaddset, (&sigmask, sigarr [i]));
   struct sigaction act =
