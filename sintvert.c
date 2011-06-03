@@ -29,6 +29,10 @@
 #include "trace.h"
 #include "midiutil.h"
 
+const char *myversion =
+#include "release.h"
+  ;
+
 // type aliases & constants
 #define MYNAME "sintvert"
 typedef jack_default_audio_sample_t sample_t;
@@ -1022,7 +1026,7 @@ static void parse_args (char **argv) {
       {
         usage (NULL);
       } else if (0 == strcmp (*argv, "--version")) {
-        printf ("%s version %s\n%s\n", MYNAME, "1.0", "Copyright (C) 2010-2011 Dan Muresan");
+        printf ("%s version %s\n%s\n", MYNAME, myversion, "Copyright (C) 2010-2011 Dan Muresan");
         exit (EXIT_SUCCESS);
       } else if (0 == strcmp (*argv, "-f") || 0 == strcmp (*argv, "--db")) {
         dbfname = *++argv;

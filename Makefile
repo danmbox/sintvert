@@ -28,7 +28,7 @@ LDFLAGS  += $(shell pkg-config --libs $(EXTPKG))
 TMP_WILD := $(TMP_WILD) *~ *.bak cscope.*
 TMP_PAT  := $(subst *,%,$(TMP_WILD))
 
-RELEASE  := $(shell cat release.txt)
+RELEASE  := $(shell tr -d '"' < release.h)
 MYNAME   := sintvert
 DISTNAME := $(MYNAME)-$(RELEASE)
 
@@ -62,6 +62,7 @@ srcdist: clean
 	  gzip -c >/tmp/$(DISTNAME).tar.gz
 
 showvars:
+	@echo "RELEASE := " $(RELEASE)
 	@echo "TMP_PAT := " $(TMP_PAT)
 	@echo "CFLAGS  := " $(CFLAGS)
 	@echo "LDFLAGS := " $(LDFLAGS)
