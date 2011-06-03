@@ -266,7 +266,7 @@ gpt_seq *gpt_seqdb = NULL;  ///< Database of gpt sequences from training
 size_t gpt_seqdb_max = 20000 /* grows */,
   gpt_seqdb_len = 0;  ///< Current size of @c gpt_seqdb
 
-void analyze_sample (sample_t x, sample_anl_state * const s) {
+static void analyze_sample (sample_t x, sample_anl_state * const s) {
   ++s->count;
   x -= s->dc; x *= s->norm_factor;
   s->sum += x; s->sum2 += SQR (x);
@@ -1198,7 +1198,7 @@ static void setup_sigs () {
 
 /// Initialize variables and resources that cannot be initialized statically.
 /// Postcondition: all globals must be in a defined state.
-void init_globals () {
+static void init_globals () {
   main_tid = pthread_self ();
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
