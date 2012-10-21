@@ -1083,7 +1083,7 @@ static void *poll_thread (void *arg) {
 
   for (;;) {
     trace_flush ();
-    struct timespec sleepreq = { tv_sec: 0, tv_nsec: 200000000L };
+    struct timespec sleepreq = { .tv_sec = 0, .tv_nsec = 200000000L };
     nanosleep (&sleepreq, NULL);
   }
 
